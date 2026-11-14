@@ -9,8 +9,10 @@
 [[ -r "$MSH_USER/aliases.zsh" ]] && source "$MSH_USER/aliases.zsh"
 
 () {
-  local f
+  local f was=$options[aliases]
+  setopt no_aliases          # see 50-addons.zsh
   for f in "$MSH_USER"/functions/*.zsh(N); do
     source "$f"
   done
+  options[aliases]=$was
 }

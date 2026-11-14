@@ -43,7 +43,8 @@ alias lls='command ls'
 
 # cat — syntax highlighting on a terminal, raw bytes in pipes
 cat() {
-  if [[ -t 1 ]] && (( $# )); then
+  # Flags (cat -n, cat -A …) mean the user wants real cat semantics.
+  if [[ -t 1 ]] && (( $# )) && [[ ${(M)@:#-*} == '' ]]; then
     if (( $+commands[bat] )); then
       command bat --paging=never --style=plain --color=always -- "$@"; return
     elif (( $+commands[highlight] )); then

@@ -20,6 +20,7 @@ test-shell: lint ## shell tests in a throwaway $HOME (never touches yours)
 	bash tests/test-configs.sh
 	bash tests/test-install.sh
 	bash tests/test-cli.sh
+	bash tests/test-zinit.sh
 
 lint: ## zsh -n every file + addon header contract
 	bash tests/lint.sh

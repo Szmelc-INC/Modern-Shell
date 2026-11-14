@@ -46,11 +46,16 @@ fi
 
 typeset -ga MSH_ADDONS_LOADED
 MSH_ADDONS_LOADED=()
+# Aliases are expanded when a function body is parsed. Sourcing with
+# NO_ALIASES keeps e.g. core-aliases' `cp -iv` out of other addons' functions;
+# `alias` itself still defines aliases for the interactive shell.
 () {
-  local name
+  local name was=$options[aliases]
+  setopt no_aliases          # only this option: addons may still setopt others
   for name in ${(ok)MSH_ADDON_FILES}; do
     msh::addon_enabled "$name" "$MSH_ADDON_FILES[$name]" || continue
     source "$MSH_ADDON_FILES[$name]"
     MSH_ADDONS_LOADED+=("$name")
   done
+  options[aliases]=$was
 }

@@ -38,6 +38,14 @@ grep -q 'snapshot: function' <<<"$out" && ok "snapshot addon loaded"
 grep -q 'keepme: alias' <<<"$out" && ok "user alias loaded"
 grep -q 'SECRET=from-secure' <<<"$out" && ok "external secure.zsh still sourced"
 if command -v zoxide >/dev/null; then grep -q 'cd: function' <<<"$out" && ok "zoxide owns cd"; fi
+# Aliases from core-aliases (cp -iv, mkdir -pv) must not leak into addon functions.
+leak=$(cd "$HOME" && zsh -i -c 'whence -f msh::snap_create msh::snap_restore' 2>/dev/null | grep -cE 'cp -iv|mkdir -pv' || true)
+[[ $leak == 0 ]] && ok "no alias expansion inside addon functions" || nok "aliases leaked into functions ($leak)"
+lines=$(cd "$HOME" && zsh -i -c 'snapshot create -l itest' 2>&1 | wc -l)
+[[ $lines == 1 ]] && ok "interactive snapshot create prints one line" || nok "snapshot printed $lines lines"
+(cd "$HOME" && zsh -i -c 'alias cp' 2>/dev/null | grep -q 'cp -iv') && ok "interactive aliases still defined"
+printf 'a\nb\n' > "$tmp/two"
+[[ $(cd "$HOME" && script -qc "zsh -i -c 'cat -n $tmp/two'" /dev/null | grep -c '1.*a') -ge 1 ]] && ok "cat -n on a terminal uses real cat"
 start=$(date +%s%N); (cd "$HOME" && zsh -i -c exit) 2>/dev/null; end=$(date +%s%N)
 echo "startup: $(( (end-start)/1000000 )) ms (no zinit)"
 

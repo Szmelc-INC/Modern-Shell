@@ -168,7 +168,7 @@ msh::snap_create() {
   while [[ -e $MSH_BACKUP/$id ]]; do id=${id%%.<->}.$((n++)); done
   local dir=$MSH_BACKUP/$id
 
-  ( umask 077; mkdir -p -- "$dir/files" ) || { msh::err "snapshot: cannot create $dir"; return 1; }
+  ( umask 077; command mkdir -p -- "$dir/files" ) || { msh::err "snapshot: cannot create $dir"; return 1; }
   chmod 700 -- "${MSH_BACKUP:h}" "$MSH_BACKUP" 2>/dev/null
 
   local p rel present=0 absent=0
@@ -176,8 +176,8 @@ msh::snap_create() {
   for p in $paths; do
     rel=${p#$HOME/}
     if [[ -e $p || -L $p ]]; then
-      mkdir -p -- "$dir/files/${rel:h}"
-      if cp -a -- "$p" "$dir/files/$rel"; then
+      command mkdir -p -- "$dir/files/${rel:h}"
+      if command cp -a -- "$p" "$dir/files/$rel"; then
         print -r -- "present	~/$rel" >> "$dir/manifest"; (( present++ ))
       else
         msh::warn "snapshot: could not copy $p"
@@ -215,8 +215,8 @@ msh::snap_list() {
   (( porcelain )) || printf "%s  #  %-32s %-19s %-12s %5s %6s%s\n" "$(msh::_c $'\e[1;34m')" ID CREATED REASON ITEMS SIZE "$(msh::_c $'\e[0m')"
   for id in $ids; do
     (( i++ ))
-    size=$(du -sh -- "$MSH_BACKUP/$id" 2>/dev/null); size=${size%%[[:space:]]*}
-    items=$(grep -c '^present' "$MSH_BACKUP/$id/manifest" 2>/dev/null)
+    size=$(command du -sh -- "$MSH_BACKUP/$id" 2>/dev/null); size=${size%%[[:space:]]*}
+    items=$(command grep -c '^present' "$MSH_BACKUP/$id/manifest" 2>/dev/null)
     if (( porcelain )); then
       print -r -- "$id	$(msh::snap_meta $id created)	$(msh::snap_meta $id label)	$(msh::snap_meta $id reason)	${items:-0}	$size"
     else
@@ -249,9 +249,9 @@ msh::snap_diff() {
       [[ -e $abs || -L $abs ]] && { msh::pp "%F{76}+ $tgt%f (created after snapshot)"; changed=1; }
     elif [[ ! -e $abs && ! -L $abs ]]; then
       msh::pp "%F{196}- $tgt%f (removed since snapshot)"; changed=1
-    elif ! diff -rq -- "$src" "$abs" >/dev/null 2>&1; then
+    elif ! command diff -rq -- "$src" "$abs" >/dev/null 2>&1; then
       msh::pp "%F{214}~ $tgt%f"
-      diff -rq -- "$src" "$abs" 2>/dev/null | sed 's/^/    /' | head -20
+      command diff -rq -- "$src" "$abs" 2>/dev/null | sed 's/^/    /' | command head -20
       changed=1
     fi
   done < "$MSH_BACKUP/$id/manifest"
@@ -302,10 +302,10 @@ msh::snap_restore() {
   while IFS=$'\t' read -r state tgt; do
     abs=$HOME/${tgt#'~/'} src=$MSH_BACKUP/$id/files/${tgt#'~/'}
     if [[ -e $abs || -L $abs ]]; then
-      rm -rf -- "$abs" || { msh::err "cannot remove $abs"; failed=1; continue; }
+      command rm -rf -- "$abs" || { msh::err "cannot remove $abs"; failed=1; continue; }
     fi
     if [[ $state == present ]]; then
-      mkdir -p -- "${abs:h}" && cp -a -- "$src" "$abs" || { msh::err "cannot restore $abs"; failed=1; }
+      command mkdir -p -- "${abs:h}" && command cp -a -- "$src" "$abs" || { msh::err "cannot restore $abs"; failed=1; }
     fi
   done < "$MSH_BACKUP/$id/manifest"
   (( failed )) && { msh::warn "restore of $id finished with errors"; return 1; }
@@ -336,7 +336,7 @@ msh::snap_rm() {
   local id
   for id in $ids; do
     [[ $id == <->-<->* && -d $MSH_BACKUP/$id ]] || continue
-    rm -rf -- "$MSH_BACKUP/$id" && msh::ok "removed $id"
+    command rm -rf -- "$MSH_BACKUP/$id" && msh::ok "removed $id"
   done
 }
 
