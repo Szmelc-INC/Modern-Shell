@@ -1,0 +1,11 @@
+post_install() {
+  echo "==> Modern Shell installed."
+  echo "    Run 'msh-setup' as your user to activate it (a snapshot of your current"
+  echo "    shell config is taken first; undo any time with: snapshot restore)."
+  echo "    Then open a new terminal and run 'msh'."
+}
+
+post_upgrade() {
+  echo "==> Modern Shell upgraded. Run 'msh-setup' (or 'msh update') to refresh your"
+  echo "    ~/.config/msh framework — your user/ layer is kept, a snapshot is taken first."
+}

@@ -1,0 +1,32 @@
+# Modern Shell — zsh loader. Real config lives in rc.d/, addons/ and user/.
+# This file is refreshed on every install/upgrade: put your own things in
+# $MSH_HOME/user/local.zsh (or manage them with `msh`).
+
+# Powerlevel10k instant prompt. Keep near the top.
+# Anything requiring console input (passwords, [y/n]) must go ABOVE this block.
+typeset -g POWERLEVEL9K_INSTANT_PROMPT=quiet
+if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
+  source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
+fi
+
+# macOS homebrew shellenv (no-op elsewhere)
+[[ -x /opt/homebrew/bin/brew ]] && eval "$(/opt/homebrew/bin/brew shellenv)"
+
+export MSH_HOME="${MSH_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/msh}"
+export MSH_USER="${MSH_USER:-$MSH_HOME/user}"
+
+# Source every runcommand in rc.d/, in lexical (numbered) order.
+for _msh_rc in "$MSH_HOME"/rc.d/*.zsh(N); do
+  source "$_msh_rc"
+done
+unset _msh_rc
+
+# Machine-local overrides — always after the framework.
+[[ -r "$MSH_USER/local.zsh" ]] && source "$MSH_USER/local.zsh"
+
+# External secret files (default: ~/.zsh/secure.zsh). Sourced read-only, last,
+# exactly like the pre-msh setup did. msh never reads, copies or edits them.
+for _msh_sec in "${MSH_EXTERNAL_SECRETS[@]}"; do
+  [[ -r "$_msh_sec" ]] && source "$_msh_sec"
+done
+unset _msh_sec

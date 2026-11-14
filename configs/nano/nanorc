@@ -1,0 +1,81 @@
+## Modern Shell — nano configuration (installed as ~/.nanorc)
+## Based on SilverX's personal nanorc: duplicates removed, backups moved out of
+## the working tree (no more stray `file~` everywhere), colors + keys added.
+
+## ── Editing ───────────────────────────────────────────────────────────────
+# keep indentation of the previous line
+set autoindent
+set tabsize 4
+# Tab inserts spaces
+set tabstospaces
+# Home jumps to the first non-blank character first
+set smarthome
+# wrap long lines visually, not in the file
+set softwrap
+# ...and wrap at word boundaries
+set atblanks
+# Delete/Backspace erase a marked region
+set zap
+# trim trailing whitespace on hard-wrapped lines
+set trimblanks
+# ^R opens files in new buffers
+set multibuffer
+# click to place cursor, wheel to scroll
+set mouse
+# treat punctuation as word boundaries for ^← ^→
+set wordbounds
+
+## ── Display ───────────────────────────────────────────────────────────────
+set linenumbers
+# always show line/column in the status bar
+set constantshow
+# scroll position bar on the right
+set indicator
+# show modified/mark/macro flags in the title bar
+set stateflags
+# soft vertical guide at column 100
+set guidestripe 100
+
+## ── Safety & history ─────────────────────────────────────────────────────
+# keep the previous version on save...
+set backup
+# ...but out of the working tree
+set backupdir "~/.cache/nano/backups"
+# reopen files at the last cursor position
+set positionlog
+# remember search/replace strings
+set historylog
+# vim-style lock files, warn on concurrent edits
+set locking
+
+## ── Colors (Midnight palette) ─────────────────────────────────────────────
+set titlecolor    bold,white,#223
+set statuscolor   bold,white,#223
+set promptcolor   bold,white,#334
+set minicolor     bold,white,#223
+set keycolor      bold,sky
+set functioncolor mauve
+set numbercolor   slate
+set selectedcolor black,#bbf
+set stripecolor   ,#223
+set scrollercolor sky
+set errorcolor    bold,white,#f8a
+set spotlightcolor black,#fea
+
+## ── Syntax highlighting ───────────────────────────────────────────────────
+include "/usr/share/nano/*.nanorc"
+include "/usr/share/nano/extra/*.nanorc"
+
+## ── Familiar keys (nano's defaults stay available) ────────────────────────
+# Ctrl+S save
+bind ^S savefile main
+# Ctrl+Q quit
+bind ^Q exit all
+# Ctrl+F find
+bind ^F whereis all
+# Ctrl+Z undo
+bind ^Z undo main
+# Ctrl+Y redo
+bind ^Y redo main
+# Alt+/ toggle comment
+bind M-/ comment main

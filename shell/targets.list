@@ -1,0 +1,11 @@
+# Every path a Modern Shell install/upgrade may create or modify.
+# This is the single source of truth: install.sh deploys only to these paths
+# and the `snapshot` addon backs up exactly these paths before every install.
+# Paths start with ~/ (relative to $HOME). Directories are copied recursively.
+~/.zshrc
+~/.nanorc
+~/.tmux.conf
+~/.config/msh
+~/.local/bin/msh
+~/.local/share/bash-completion/completions/msh
+~/.config/fish/completions/msh.fish
