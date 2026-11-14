@@ -12,8 +12,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/sernik77/modern-shell/internal/store"
-	"github.com/sernik77/modern-shell/internal/ui"
+	"github.com/Szmelc-INC/Modern-Shell/internal/store"
+	"github.com/Szmelc-INC/Modern-Shell/internal/ui"
 )
 
 // Flag is a command-specific option. Arg != "" means it takes a value.

@@ -52,7 +52,7 @@ everything toggleable.
 > `~/.BACKUP/msh/<timestamp>_pre-install`, and it only ever writes to those paths.
 
 ```sh
-git clone https://github.com/sernik77/modern-shell && cd modern-shell
+git clone https://github.com/Szmelc-INC/Modern-Shell && cd modern-shell
 ./install.sh --dry-run     # see what would happen
 ./install.sh               # do it (asks before installing packages, via pkexec)
 exec zsh
@@ -61,7 +61,7 @@ exec zsh
 | Distro | |
 |---|---|
 | **Arch** | `cd packaging/arch && makepkg -si`, then run `msh-setup` as your user |
-| **Nix** | `nix run github:sernik77/modern-shell` (msh), `nix run github:sernik77/modern-shell#setup` |
+| **Nix** | `nix run github:Szmelc-INC/Modern-Shell` (msh), `nix run github:Szmelc-INC/Modern-Shell#setup` |
 | **Any** | `./install.sh` — needs `zsh git fzf zoxide`; `go` to build `msh` |
 
 Installer flags: `-y/--yes`, `-n/--dry-run`, `--no-deps`, `--no-nano`, `--no-tmux`,

@@ -9,7 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/sernik77/modern-shell/internal/store"
+	"github.com/Szmelc-INC/Modern-Shell/internal/store"
 )
 
 func testModel(t *testing.T) *model {

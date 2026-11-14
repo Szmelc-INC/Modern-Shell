@@ -19,7 +19,7 @@ import (
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/sernik77/modern-shell/internal/store"
+	"github.com/Szmelc-INC/Modern-Shell/internal/store"
 )
 
 type model struct {
@@ -904,9 +904,9 @@ func (m *model) runPalette(cmd, arg string) tea.Cmd {
 
 // ── view ──────────────────────────────────────────────────────────────────
 
-func (m *model) wide() bool      { return m.w >= 100 }
-func (m *model) listWidth() int  { return max(m.w*44/100, 40) }
-func (m *model) logo() string    { return sLogo.Render("◆ msh") + " " }
+func (m *model) wide() bool     { return m.w >= 100 }
+func (m *model) listWidth() int { return max(m.w*44/100, 40) }
+func (m *model) logo() string   { return sLogo.Render("◆ msh") + " " }
 func (m *model) tabLabel(t int) string {
 	label := fmt.Sprintf("%d %s", t+1, tabTitles[t])
 	count := ""

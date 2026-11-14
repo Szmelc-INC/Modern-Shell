@@ -8,9 +8,9 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/sernik77/modern-shell/internal/store"
-	"github.com/sernik77/modern-shell/internal/tui"
-	"github.com/sernik77/modern-shell/internal/ui"
+	"github.com/Szmelc-INC/Modern-Shell/internal/store"
+	"github.com/Szmelc-INC/Modern-Shell/internal/tui"
+	"github.com/Szmelc-INC/Modern-Shell/internal/ui"
 )
 
 // Root builds the full msh command tree.

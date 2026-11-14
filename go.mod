@@ -1,4 +1,4 @@
-module github.com/sernik77/modern-shell
+module github.com/Szmelc-INC/Modern-Shell
 
 go 1.26
 

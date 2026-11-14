@@ -48,7 +48,7 @@
 
           meta = with pkgs.lib; {
             description = "Modular, colorful zsh environment with snapshots and the msh TUI/CLI manager";
-            homepage = "https://github.com/sernik77/modern-shell";
+            homepage = "https://github.com/Szmelc-INC/Modern-Shell";
             license = licenses.mit;
             mainProgram = "msh";
             platforms = platforms.unix;

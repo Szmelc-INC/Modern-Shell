@@ -35,13 +35,13 @@ func (f *field) value() string {
 }
 
 type formModal struct {
-	title    string
-	helpKey  string
-	fields   []*field
-	focus    int
-	err      string
-	submit   func(vals []string) (tea.Cmd, error) // error keeps the form open
-	width    int
+	title   string
+	helpKey string
+	fields  []*field
+	focus   int
+	err     string
+	submit  func(vals []string) (tea.Cmd, error) // error keeps the form open
+	width   int
 }
 
 func newField(label, value, hint string) *field {

@@ -6,7 +6,7 @@ package main
 import (
 	"os"
 
-	"github.com/sernik77/modern-shell/internal/cli"
+	"github.com/Szmelc-INC/Modern-Shell/internal/cli"
 )
 
 // version is set at build time: -ldflags "-X main.version=…".

@@ -5,8 +5,8 @@ import (
 	"io"
 	"strings"
 
-	"github.com/sernik77/modern-shell/internal/store"
-	"github.com/sernik77/modern-shell/internal/tui"
+	"github.com/Szmelc-INC/Modern-Shell/internal/store"
+	"github.com/Szmelc-INC/Modern-Shell/internal/tui"
 )
 
 // The shell scripts are thin: they call `msh __complete <words…>` and the Go side

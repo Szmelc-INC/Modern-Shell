@@ -3,7 +3,7 @@ package tui
 import (
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/sernik77/modern-shell/internal/ui"
+	"github.com/Szmelc-INC/Modern-Shell/internal/ui"
 )
 
 var (

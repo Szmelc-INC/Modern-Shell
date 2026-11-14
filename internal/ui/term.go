@@ -40,13 +40,13 @@ func paint(code, s string) string {
 	return "\x1b[" + code + "m" + s + "\x1b[0m"
 }
 
-func Bold(s string) string    { return paint("1", s) }
-func Dim(s string) string     { return paint("2", s) }
-func Blue(s string) string    { return paint("1;38;2;122;162;247", s) }
-func Lilac(s string) string   { return paint("38;2;180;190;254", s) }
-func Green(s string) string   { return paint("38;2;166;227;161", s) }
-func Yellow(s string) string  { return paint("38;2;249;226;175", s) }
-func Red(s string) string     { return paint("38;2;243;139;168", s) }
+func Bold(s string) string     { return paint("1", s) }
+func Dim(s string) string      { return paint("2", s) }
+func Blue(s string) string     { return paint("1;38;2;122;162;247", s) }
+func Lilac(s string) string    { return paint("38;2;180;190;254", s) }
+func Green(s string) string    { return paint("38;2;166;227;161", s) }
+func Yellow(s string) string   { return paint("38;2;249;226;175", s) }
+func Red(s string) string      { return paint("38;2;243;139;168", s) }
 func GrayText(s string) string { return paint("38;2;108;112;134", s) }
 
 // Status helpers (stderr for warnings/errors).

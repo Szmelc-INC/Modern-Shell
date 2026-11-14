@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/sernik77/modern-shell/internal/store"
+	"github.com/Szmelc-INC/Modern-Shell/internal/store"
 )
 
 const (

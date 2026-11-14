@@ -27,7 +27,7 @@ func ValidName(kind Kind, name string) bool {
 	return false
 }
 
-// Quote returns s as a zsh single-quoted word ('it'\''s').
+// Quote returns s as a zsh single-quoted word; each embedded quote is written as quote, backslash, quote, quote.
 func Quote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
