@@ -1,0 +1,17 @@
+# Reference source projects (separate git repos)
+Silver-ZSH/
+ZRC/
+
+# Editor backups
+*~
+
+# Build output
+/bin/
+/dist/
+/result
+/result-*
+
+# Arch packaging artifacts
+/packaging/arch/src/
+/packaging/arch/pkg/
+*.pkg.tar.*
