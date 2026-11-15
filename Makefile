@@ -53,9 +53,9 @@ dist: ## source tarball for packaging (dist/modern-shell-VERSION.tar.gz)
 	mkdir -p dist
 	git archive --format=tar.gz --prefix=modern-shell-$(VERSION)/ -o dist/modern-shell-$(VERSION).tar.gz HEAD
 
-arch-pkg: dist ## build the Arch package from the current commit
-	cp dist/modern-shell-$(VERSION).tar.gz packaging/arch/
-	cd packaging/arch && makepkg -f --noconfirm
+arch-pkg: ## build the Arch package from the working tree (as SAUR does) into dist/
+	mkdir -p dist
+	bash tests/test-pkgbuild.sh $(CURDIR)/dist
 
 vendor-hash: ## recompute vendorHash for flake.nix (no nix needed)
 	python3 -I tests/vendor-hash.py

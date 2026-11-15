@@ -60,7 +60,8 @@ exec zsh
 
 | Distro | |
 |---|---|
-| **Arch** | `cd packaging/arch && makepkg -si`, then run `msh-setup` as your user |
+| **Arch ([SAUR](https://szmelc-inc.github.io/SAUR))** | `curl -fsSL https://szmelc-inc.github.io/SAUR/add \| sudo bash`, then `sudo pacman -S saur/modern-shell` and run `msh-setup` as your user |
+| **Arch (source)** | `cd packaging/arch && makepkg -si` (builds the checkout you are in), then `msh-setup` |
 | **Nix** | `nix run github:Szmelc-INC/Modern-Shell` (msh), `nix run github:Szmelc-INC/Modern-Shell#setup` |
 | **Any** | `./install.sh` — needs `zsh git fzf zoxide`; `go` to build `msh` |
 
@@ -153,7 +154,7 @@ make build        # bin/msh
 make test         # Go unit + headless TUI tests, shell tests in a throwaway $HOME
 make tui-capture  # text screenshots of the real TUI via tmux
 make lint         # zsh -n + addon header contract
-make arch-pkg     # build the Arch package from HEAD
+make arch-pkg     # build the Arch package from the working tree into dist/ (as SAUR does)
 make vendor-hash  # refresh flake.nix vendorHash (no nix required)
 ```
 
