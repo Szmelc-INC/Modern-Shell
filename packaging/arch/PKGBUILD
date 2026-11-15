@@ -60,6 +60,7 @@ package() {
   local share="$pkgdir/usr/share/$pkgname"
   install -dm755 "$share"
   cp -a shell configs install.sh uninstall.sh "$share/"
+  find "$share" -name __pycache__ -type d -prune -exec rm -rf {} +
   install -Dm755 /dev/stdin "$pkgdir/usr/bin/msh-setup" <<'EOF'
 #!/bin/sh
 # Set up Modern Shell for the current user (takes a snapshot of everything first).
