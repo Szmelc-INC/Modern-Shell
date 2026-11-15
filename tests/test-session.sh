@@ -14,6 +14,7 @@ bad()  { echo "${red}FAIL${reset} $1"; fail=1; }
 
 T=$(mktemp -d)
 trap 'kill $SECRET_PID $PLAIN_PID 2>/dev/null; rm -rf "$T"' EXIT
+export PYTHONDONTWRITEBYTECODE=1
 export HOME=$T/home XDG_CONFIG_HOME=$T/home/.config XDG_DATA_HOME=$T/home/.local/share NO_COLOR=1
 export MSH_SESSIONS=$T/store MSH_SESSION_CONFIG=$T/session.toml HYPRLAND_INSTANCE_SIGNATURE=fake
 mkdir -p "$HOME/.zsh" "$T/bin" "$HOME/work"
@@ -151,7 +152,33 @@ doc = {"a": 1, "s": 'q"\n\\', "l": [1, 2], "t": {"x": {"y": True}}, "arr": [{"k"
 assert tomllib.loads(m.toml_dumps(doc)) == doc
 PY
 
-# 7. completions
+# 7. Kate: session parse + install as msh-<name> with the stash paths rewritten
+python3 - "$BIN" "$T" <<'PY' && pass "Kate session/stash parse + install" || bad "Kate session install"
+import importlib.machinery, importlib.util, sys
+from pathlib import Path
+loader = importlib.machinery.SourceFileLoader("ms", sys.argv[1])
+spec = importlib.util.spec_from_loader("ms", loader); m = importlib.util.module_from_spec(spec); loader.exec_module(m)
+snap = Path(sys.argv[2]) / "kate-snap"
+data = snap / "apps/kate/42"
+(data / "stash").mkdir(parents=True)
+stash = m.KateHandler.KDATA / "stash/def.katesession"
+(data / "session.katesession").write_text(
+    "[Document 0]\nURL=file:///tmp/a.txt\n\n[Document 1]\nURL=\nstashedFile=%s/Document 1\n" % stash)
+(data / "stash/Document 1").write_text("never saved text")
+docs = m.KateHandler.parse(data, "def")
+assert docs == [{"url": "/tmp/a.txt"}, {"stashed": "Document 1", "state": "new-unsaved"}], docs
+ctx = m.Ctx(m.load_config(), None, snap, "work")
+ctx.restoring = True
+win = {"proc": {"cmdline": ["kate", "-b"]}, "app": {"handler": "kate", "session": "def", "data": "apps/kate/42"}}
+argv = m.KateHandler().launch(ctx, win)
+assert argv == ["kate", "-b", "-s", "msh-work"], argv
+kd = m.KateHandler.KDATA
+text = (kd / "sessions/msh-work.katesession").read_text()
+assert "/stash/msh-work.katesession/Document 1" in text and "/stash/def.katesession/" not in text, text
+assert (kd / "stash/msh-work.katesession/Document 1").read_text() == "never saved text"
+PY
+
+# 8. completions
 for sh in zsh bash fish; do
   python3 "$BIN" completion $sh | grep -q msh-session && pass "completion $sh" || bad "completion $sh"
 done

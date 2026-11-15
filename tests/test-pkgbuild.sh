@@ -7,7 +7,7 @@ ver=$(cat "$repo/shell/VERSION")
 work=${1:-$(mktemp -d)}
 mkdir -p "$work"
 cp "$repo/packaging/arch/PKGBUILD" "$repo/packaging/arch/modern-shell.install" "$work/"
-tar -C "$repo" --exclude=.git --exclude=bin --exclude=dist --exclude=.claude \
+tar -C "$repo" --exclude=./.git --exclude=./bin --exclude=./dist --exclude=./.claude \
   --transform "s,^\.,modern-shell-$ver," -czf "$work/modern-shell-$ver.tar.gz" .
 cd "$work"
 GOPROXY=off makepkg -f --noconfirm --nodeps >makepkg.log 2>&1 || { tail -30 makepkg.log; exit 1; }
