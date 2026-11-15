@@ -26,11 +26,14 @@ msh-session restore work --dry-run # only print the plan (reuse / launch / close
 msh-session diff work              # snapshot vs the live session
 ```
 
-Hyprland bindings, for example:
+Hyprland bindings, for example (`install.sh` puts the tool in
+`~/.config/msh/bin`, which only zsh has on `PATH` — use the full path there;
+with the Arch package it is `/usr/bin/msh-session`):
 
 ```ini
-bind = SUPER ALT, S, exec, msh-session save quick -f -y
-bind = SUPER ALT, R, exec, kitty -e msh-session switch    # fzf picker
+$msess = ~/.config/msh/bin/msh-session
+bind = SUPER ALT, S, exec, $msess save quick -f -y
+bind = SUPER ALT, R, exec, kitty -e $msess switch    # fzf picker
 ```
 
 ## What a snapshot contains
@@ -95,9 +98,12 @@ need remote debugging; mpv's position needs `input-ipc-server`.
    `auto-pre-switch-*` (the newest `keep_auto` are kept), so any restore can be
    undone with `switch auto-…`.
 2. Snapshot windows are paired with open ones (`same()` per handler: title,
-   command line, terminal directory; Kate and OBS are single-instance).
+   command line, terminal directory; Kate and OBS are single-instance). A
+   browser or file manager whose title changed since (other tab, other folder)
+   is still paired when it is the only window of its class on both sides.
 3. `switch` (and `restore --close-others`) closes the rest gracefully —
-   apps may ask to save; nothing is killed.
+   apps may ask to save; nothing is killed. The terminal that runs
+   `msh-session` is never closed (shown as `keep` in the plan).
 4. Missing windows are launched at once (`uwsm app --` under UWSM, else
    `hyprctl dispatch exec`); new windows are recognised as they map.
 5. Every window is moved to its workspace, (un)floated, resized, positioned

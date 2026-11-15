@@ -557,6 +557,7 @@ class Ctx:
 class Handler:
     key = "generic"
     classes: tuple[str, ...] = ()
+    loose = False       # identity drifts (active tab, current folder): pair 1:1 by class as a fallback
 
     def match(self, cls: str) -> bool:
         c = cls.lower()
@@ -850,11 +851,13 @@ class KateHandler(Handler):
         if not src or not (src / "session.katesession").is_file():
             return None
         target = self.target_session(ctx)
-        orig = win["app"].get("session", "")
         sessions, stash = self.KDATA / "sessions", self.KDATA / "stash" / f"{target}.katesession"
         sessions.mkdir(parents=True, exist_ok=True)
         text = (src / "session.katesession").read_text()
-        text = text.replace(f"/stash/{orig}.katesession/", f"/stash/{target}.katesession/")
+        # Point every stashed document at this machine's stash dir (the snapshot may
+        # come from another $HOME, another session name, or an imported archive).
+        text = re.sub(r"(?m)^stashedFile=.*/([^/\n]+)$",
+                      lambda mo: f"stashedFile={stash / mo.group(1)}", text)
         (sessions / f"{target}.katesession").write_text(text)
         if stash.exists():
             shutil.rmtree(stash)
@@ -891,6 +894,7 @@ class KateHandler(Handler):
 class ChromiumHandler(Handler):
     """Chromium-family browsers: tabs per window from the SNSS session log."""
     key = "chromium"
+    loose = True
     classes = ("thorium-browser", "thorium", "chromium", "google-chrome*", "brave-browser*",
                "vivaldi*", "microsoft-edge*", "opera", "cromite")
     PROFILE_DIRS = {"thorium": "thorium", "chromium": "chromium", "google-chrome": "google-chrome",
@@ -1118,6 +1122,7 @@ class ObsHandler(Handler):
 
 class FileManagerHandler(Handler):
     key = "filemanager"
+    loose = True
     classes = ("thunar", "org.gnome.nautilus", "pcmanfm*", "nemo", "org.kde.dolphin", "caja")
 
     def capture(self, ctx: Ctx, client: dict, win: dict) -> None:
@@ -1514,7 +1519,29 @@ def match_windows(specs: list[dict], live: list[dict]) -> list[tuple[dict, dict]
         used_s.add(sid)
         used_c.add(addr)
         out.append((s, c))
+    # Browsers and file managers change their title with every tab/folder: when
+    # exactly one window of such a class is left on each side, they are the same.
+    for s in specs:
+        if s["id"] in used_s or not handler_for(s["class"]).loose:
+            continue
+        cls = s["class"].lower()
+        ls = [x for x in specs if x["id"] not in used_s and x["class"].lower() == cls]
+        lc = [c for c in live if c["address"] not in used_c and (c.get("class") or "").lower() == cls]
+        if len(ls) == 1 and len(lc) == 1:
+            used_s.add(s["id"])
+            used_c.add(lc[0]["address"])
+            out.append((s, lc[0]))
     return out
+
+
+def own_ancestors() -> set[int]:
+    """PIDs of this process and its parents (the terminal running us must survive a switch)."""
+    pids, pid = set(), os.getpid()
+    pt = ProcTable()
+    while pid > 1 and pid not in pids:
+        pids.add(pid)
+        pid = pt.ppid.get(pid, 0)
+    return pids
 
 
 def launch_env(cfg: dict, argv: list[str]) -> list[str]:
@@ -1610,11 +1637,16 @@ def do_restore(cfg: dict, store: Store, wm: Hyprland, name: str, *, close_others
     reused = {s["id"]: c for s, c in pairs}
     to_launch = [s for s in specs if s["id"] not in reused]
     matched_addr = {c["address"] for c in reused.values()}
-    to_close = [c for c in live if c["address"] not in matched_addr] if close_others else []
+    mine = own_ancestors()
+    keep = [c for c in live if c["address"] not in matched_addr and c.get("pid") in mine]
+    to_close = [c for c in live if c["address"] not in matched_addr and c.get("pid") not in mine] \
+        if close_others else []
 
     plan = {"session": name, "reuse": [[s["id"], c["address"]] for s, c in pairs],
             "launch": [{"id": s["id"], "command": (s.get("restore") or {}).get("command", [])} for s in to_launch],
-            "close": [{"address": c["address"], "class": c.get("class"), "title": c.get("title")} for c in to_close]}
+            "close": [{"address": c["address"], "class": c.get("class"), "title": c.get("title")} for c in to_close],
+            "keep": [{"address": c["address"], "class": c.get("class"), "reason": "runs msh-session"}
+                     for c in keep] if close_others else []}
     if as_json and dry:
         print(json.dumps(plan, indent=2, ensure_ascii=False))
         return 0
@@ -1622,6 +1654,9 @@ def do_restore(cfg: dict, store: Store, wm: Hyprland, name: str, *, close_others
     rows += [[Out.c("1;34", "launch"), s["workspace"], s["class"], trunc(s["title"], 50)] for s in to_launch]
     rows += [[Out.c("1;31", "close"), c["workspace"]["name"], c.get("class", ""), trunc(c.get("title", ""), 50)]
              for c in to_close]
+    if close_others:
+        rows += [[Out.c("33", "keep"), c["workspace"]["name"], c.get("class", ""), "(runs msh-session) "
+                  + trunc(c.get("title", ""), 32)] for c in keep]
     if not as_json:
         Out.info(f"restore plan for {Out.c('1;35', name)}")
         table(rows, ["ACTION", "WS", "CLASS", "TITLE"])

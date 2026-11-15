@@ -37,7 +37,8 @@
 # |
 # | Snapshots live in `~/.local/share/msh/sessions/<name>/` (mode 700).
 # | Settings: `msh-session config init` → `$MSH_USER/session.toml`.
-# | Bind it in Hyprland, e.g. `bind = SUPER ALT, S, exec, msh-session save quick -f -y`.
+# | Bind it in Hyprland with the full path (Hyprland's PATH lacks `$MSH_HOME/bin`), e.g.
+# | `bind = SUPER ALT, S, exec, ~/.config/msh/bin/msh-session save quick -f -y`.
 
 # sess [command] [args] — msh-session front-end; no arguments lists snapshots
 sess() {

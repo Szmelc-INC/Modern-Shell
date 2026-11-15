@@ -132,6 +132,24 @@ python3 "$BIN" switch s1 -y --no-state >/dev/null 2>&1
 [[ -n $(python3 "$BIN" list -a --names | grep '^auto-pre-switch-') ]] && pass "switch takes an auto snapshot" \
   || bad "no auto snapshot"
 
+# 5b. switch never closes the terminal that runs msh-session (pid $$ is an ancestor)
+write_clients "$(client 0x1 fakeapp "Notes" 2 100 200 640 480 true "$PLAIN_PID")" \
+              "$(client 0x9 hostterm "my shell" 1 0 0 800 600 false "$$")"
+: > "$T/hyprctl.log"
+python3 "$BIN" switch s1 -y --no-backup --no-state >/dev/null 2>&1
+if grep -q 'closewindow address:0x9' "$T/hyprctl.log"; then bad "switch closed its own terminal"
+else pass "switch keeps the terminal running it"; fi
+
+# 5c. browsers: the title follows the active tab — one window per side still pairs
+write_clients "$(client 0x4 thorium-browser "Tab A - Thorium" 6 0 0 800 600 false "$PLAIN_PID")" \
+              "$(client 0x2 secretapp "Secret" 3 0 0 1920 1080 false "$SECRET_PID")"
+python3 "$BIN" save s2 --no-shots >/dev/null 2>&1
+write_clients "$(client 0x4 thorium-browser "Other tab - Thorium" 6 0 0 800 600 false "$PLAIN_PID")" \
+              "$(client 0x2 secretapp "Secret" 3 0 0 1920 1080 false "$SECRET_PID")"
+plan=$(python3 "$BIN" restore s2 --dry-run --json)
+python3 -c 'import json,sys; p=json.loads(sys.argv[1]); assert ["w02-thorium-browser","0x4"] in p["reuse"] and not p["launch"], p' \
+  "$plan" && pass "browser window reused after a tab change" || bad "browser duplicated: $plan"
+
 # 6. SNSS parser + TOML emitter round trip
 python3 - "$BIN" <<'PY' && pass "SNSS parser + TOML round trip" || bad "SNSS/TOML"
 import importlib.machinery, importlib.util, struct, sys, tomllib
@@ -161,7 +179,7 @@ spec = importlib.util.spec_from_loader("ms", loader); m = importlib.util.module_
 snap = Path(sys.argv[2]) / "kate-snap"
 data = snap / "apps/kate/42"
 (data / "stash").mkdir(parents=True)
-stash = m.KateHandler.KDATA / "stash/def.katesession"
+stash = "/other/home/.local/share/kate/stash/def.katesession"  # snapshot from another $HOME
 (data / "session.katesession").write_text(
     "[Document 0]\nURL=file:///tmp/a.txt\n\n[Document 1]\nURL=\nstashedFile=%s/Document 1\n" % stash)
 (data / "stash/Document 1").write_text("never saved text")
