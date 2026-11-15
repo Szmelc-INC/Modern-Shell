@@ -1,4 +1,9 @@
 # Maintainer: SilverX (serainox420) <serainox@gmail.com>
+#
+# Builds from the checkout this PKGBUILD lives in (like SAUR's own PKGBUILD), so SAUR
+# and a local `cd packaging/arch && makepkg -si` package exactly the commit at hand.
+# Keep pkgver equal to shell/VERSION (tests/test-pkgbuild.sh checks it); SAUR bumps
+# pkgrel by itself when the code changes under the same pkgver.
 pkgname=modern-shell
 pkgver=0.1.0
 pkgrel=1
@@ -23,41 +28,47 @@ optdepends=(
   'xclip: clipboard addon on X11'
 )
 install=modern-shell.install
-source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+
+# Repository root; build output goes to $srcdir so the checkout stays clean.
+_root() { cd "$startdir/../.."; }
 
 build() {
-  cd "$pkgname-$pkgver"
-  export CGO_ENABLED=0 GOFLAGS="-buildmode=pie -trimpath -mod=readonly -modcacherw"
-  go build -ldflags "-s -w -X main.version=$pkgver" -o build/msh ./cmd/msh
-  ./build/msh completion zsh  > build/_msh
-  ./build/msh completion bash > build/msh.bash
-  ./build/msh completion fish > build/msh.fish
+  _root
+  export CGO_ENABLED=0 GOPATH="$srcdir/go" GOFLAGS="-buildmode=pie -trimpath -mod=readonly -modcacherw"
+  local out="$srcdir/build"
+  mkdir -p "$out"
+  go build -ldflags "-s -w -X main.version=$pkgver" -o "$out/msh" ./cmd/msh
+  "$out/msh" completion zsh  > "$out/_msh"
+  "$out/msh" completion bash > "$out/msh.bash"
+  "$out/msh" completion fish > "$out/msh.fish"
 }
 
 check() {
-  cd "$pkgname-$pkgver"
+  _root
+  export CGO_ENABLED=0 GOPATH="$srcdir/go" GOFLAGS="-mod=readonly -modcacherw"
   go test ./internal/store/
   bash tests/lint.sh
 }
 
 package() {
-  cd "$pkgname-$pkgver"
-  install -Dm755 build/msh "$pkgdir/usr/bin/msh"
+  _root
+  local out="$srcdir/build"
+  install -Dm755 "$out/msh" "$pkgdir/usr/bin/msh"
 
   # Per-user setup uses the same installer (snapshot first, user layer kept).
   local share="$pkgdir/usr/share/$pkgname"
   install -dm755 "$share"
   cp -a shell configs install.sh uninstall.sh "$share/"
+  find "$share" -name __pycache__ -prune -exec rm -rf {} +
   install -Dm755 /dev/stdin "$pkgdir/usr/bin/msh-setup" <<'EOF'
 #!/bin/sh
 # Set up Modern Shell for the current user (takes a snapshot of everything first).
 exec bash /usr/share/modern-shell/install.sh --no-binary "$@"
 EOF
 
-  install -Dm644 build/_msh     "$pkgdir/usr/share/zsh/site-functions/_msh"
-  install -Dm644 build/msh.bash "$pkgdir/usr/share/bash-completion/completions/msh"
-  install -Dm644 build/msh.fish "$pkgdir/usr/share/fish/vendor_completions.d/msh.fish"
+  install -Dm644 "$out/_msh"     "$pkgdir/usr/share/zsh/site-functions/_msh"
+  install -Dm644 "$out/msh.bash" "$pkgdir/usr/share/bash-completion/completions/msh"
+  install -Dm644 "$out/msh.fish" "$pkgdir/usr/share/fish/vendor_completions.d/msh.fish"
 
   install -Dm644 LICENSE   "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
