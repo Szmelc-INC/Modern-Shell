@@ -51,6 +51,7 @@ func (p Paths) FunctionsDir() string   { return filepath.Join(p.User, "functions
 func (p Paths) ConfFile() string       { return filepath.Join(p.User, "msh.conf") }
 func (p Paths) LocalFile() string      { return filepath.Join(p.User, "local.zsh") }
 func (p Paths) SnapshotScript() string { return filepath.Join(p.Home, "addons", "snapshot.zsh") }
+func (p Paths) SessionScript() string  { return filepath.Join(p.Home, "bin", "msh-session") }
 func (p Paths) Version() string {
 	b, err := os.ReadFile(filepath.Join(p.Home, "VERSION"))
 	if err != nil {

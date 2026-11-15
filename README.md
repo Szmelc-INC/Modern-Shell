@@ -26,9 +26,13 @@ everything toggleable.
   documented, switchable on/off. See [docs/ADDONS.md](docs/ADDONS.md).
 - **Snapshots** — every install first copies everything it will touch to
   `~/.BACKUP/msh/<id>`; `snapshot restore` is a *full* revert.
+- **Desktop sessions** — `msh-session` snapshots the whole Hyprland/UWSM
+  session (every window's place and state, the apps behind them, open files,
+  tabs, terminal directories and **unsaved data**) and restores or switches
+  between sessions in seconds. See [docs/SESSIONS.md](docs/SESSIONS.md).
 - **`msh`** — an interactive TUI and a scriptable CLI for addons, aliases,
-  functions, env vars, secrets, zoxide directories and snapshots, with **F1
-  context help** everywhere.
+  functions, env vars, secrets, zoxide directories, snapshots and desktop
+  sessions, with **F1 context help** everywhere.
 - **Companions** — a polished `~/.nanorc` and `~/.tmux.conf` in the same Midnight palette.
 
 ```
@@ -78,7 +82,7 @@ are sourced last via `MSH_EXTERNAL_SECRETS` and **never read, copied or modified
 
 ## Using `msh`
 
-`msh` with no arguments opens the TUI. Keys: `tab`/`1-7` tabs · `↑↓` move ·
+`msh` with no arguments opens the TUI. Keys: `tab`/`1-8` tabs · `↑↓` move ·
 `space` on/off · `a` add · `e` edit · `d` delete · `/` filter · `:` command palette ·
 **`F1` help for whatever is selected or open** · `?` all keys · `q` quit.
 Enter on a directory in the *Dirs* tab `cd`s your shell there.
@@ -93,6 +97,7 @@ msh env set PAGER less
 msh secret set GITHUB_TOKEN          # hidden prompt, stored mode 600, masked in lists
 msh dir list -n 10                   # zoxide database
 msh snapshot create -l before-experiment
+msh session save work -m 'coding setup'   # desktop session (msh-session)
 msh doctor                           # check deps + installation
 msh completion zsh|bash|fish
 ```
@@ -110,6 +115,20 @@ snapshot restore [id|#]      # full revert; picker without an id; takes a pre-re
 snapshot rm [id|#...]        # picker + confirmation
 ```
 
+### Desktop sessions (Hyprland + UWSM)
+
+```sh
+sess save work -m "coding"   # every window, app, open file, tab and unsaved buffer
+sess switch music            # close what is not in "music", restore it (auto-backup first)
+sess restore work --dry-run  # plan only: reuse / launch / close
+sess show work               # windows + unsaved-data files
+msh-session doctor           # what can be captured here
+```
+
+Kate's never-saved documents come back unsaved; text of accessible editors and
+kitty scrollback is kept in `<snapshot>/unsaved/`. Full details:
+[docs/SESSIONS.md](docs/SESSIONS.md).
+
 ## Layout
 
 ```
@@ -125,6 +144,7 @@ snapshot rm [id|#...]        # picker + confirmation
     ├── aliases.zsh env.zsh secrets.zsh functions/
     └── local.zsh            machine-specific, sourced last
 ~/.BACKUP/msh/<id>/          snapshots (mode 700)
+~/.local/share/msh/sessions/ desktop session snapshots (msh-session, mode 700)
 ```
 
 > The Bible's canonical root is `~/.zsh/`; Modern Shell uses `~/.config/msh` so it

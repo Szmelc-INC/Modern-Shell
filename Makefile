@@ -17,6 +17,7 @@ test-go: ## Go unit + headless TUI tests
 test-shell: lint ## shell tests in a throwaway $HOME (never touches yours)
 	bash tests/test-addons.sh
 	bash tests/test-snapshot.sh
+	bash tests/test-session.sh
 	bash tests/test-configs.sh
 	bash tests/test-install.sh
 	bash tests/test-cli.sh

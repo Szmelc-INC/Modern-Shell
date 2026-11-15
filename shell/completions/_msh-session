@@ -1,0 +1,43 @@
+#compdef msh-session
+# zsh completion for msh-session
+_msh_session_names() {
+  local -a n; n=(${(f)"$(msh-session list --all --names 2>/dev/null)"}); _describe 'snapshot' n
+}
+_msh-session() {
+  local -a cmds; cmds=(
+    'save:snapshot the running session (windows, apps, unsaved data)'
+    'restore:bring a snapshot back (reuse open windows, launch the rest)'
+    'switch:close everything not in a snapshot, then restore it'
+    'list:list snapshots (newest first)'
+    'show:windows, apps and unsaved data inside a snapshot'
+    'status:what would be saved right now'
+    'diff:compare a snapshot with another one or the live session'
+    'rm:delete snapshots'
+    'prune:delete old automatic snapshots'
+    'rename:rename a snapshot'
+    'path:print the store or a snapshot directory'
+    'export:pack a snapshot into a .tar.gz'
+    'import:unpack an exported snapshot'
+    'doctor:check what can be captured on this system'
+    'a11y:turn accessibility on/off for Qt/Electron apps (unsaved text)'
+    'config:show, init or locate the config file'
+    'completion:print shell completion (zsh, bash, fish)'
+  )
+  if (( CURRENT == 2 )); then _describe 'command' cmds; return; fi
+  case $words[2] in
+    restore|switch|show|diff|rm|rename|path|export) _arguments '*:snapshot:_msh_session_names' '--json[JSON output]' \
+        '(-y --yes)'{-y,--yes}'[do not ask]' '(-n --dry-run)'{-n,--dry-run}'[only show the plan]' \
+        '--keep[keep windows not in the snapshot]' '--close-others[close windows not in the snapshot]' \
+        '--no-place[do not move windows]' '--no-backup[no automatic snapshot first]' \
+        '(-u --update)'{-u,--update}'[save the active session first]' '--no-files[hide unsaved files]';;
+    save) _arguments '1:name:' '(-m --message)'{-m,--message}'[note]:note:' '--no-shots[no screenshots]' \
+        '(-f --force)'{-f,--force}'[replace]' '--json[JSON output]';;
+    a11y) _values 'action' on off status;;
+    config) _values 'action' show init path;;
+    completion) _values 'shell' zsh bash fish;;
+    import) _files;;
+    *) _arguments '--json[JSON output]' '(-a --all)'{-a,--all}'[include automatic]' '--names[names only]' \
+        '(-y --yes)'{-y,--yes}'[do not ask]' '--keep[how many to keep]:n:';;
+  esac
+}
+compdef _msh-session msh-session 2>/dev/null || _msh-session "$@"

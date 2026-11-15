@@ -12,6 +12,7 @@ needs keys/cookies, or talks to third-party services.
 |---|---|---|---|---|
 | `core-aliases` | on | CORE, FILES, EYECANDY | `ls`/`ll`/`la`/`lt` (eza), highlighted `cat`, colored grep/diff/ip, `reload` | (shipped) |
 | `snapshot` | on | CORE, SYSTEM, SECURITY | `snapshot create/list/diff/restore/rm/prune` | (shipped) |
+| `session` | on | SYSTEM, PROCESS | `sess save/restore/switch/list/show/diff` — desktop session snapshots via `msh-session` (Hyprland + UWSM; windows, apps, unsaved data), see [SESSIONS.md](SESSIONS.md) | (shipped) |
 | `msh` | on | CORE | `msh` wrapper (TUI directory jumps `cd` your shell), `msh-snaps`, `msh-edit-local`, `msh-edit-conf` | (shipped) |
 | `archives` | on | FILES | `extract [-d DIR] [-l]` (tar.*, zip, 7z, rar, gz, xz, zst, deb, rpm…), `archivize` (7z/zip/rar, password, hidden names, wizard) | ZRC `extract-archives`, `.zshrc` `extract`, `archivize.zsh` |
 | `clipboard` | on | CLIPBOARD, CORE | `copy`, `copyf`, `paste`, `copy-path`, `clipboard-backend` — wl-copy → xclip → xsel → OSC 52 | ZRC `copy-paste`, `copy-file-contents`, `.zshrc` copy/paste |

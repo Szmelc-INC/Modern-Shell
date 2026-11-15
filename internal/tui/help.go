@@ -129,6 +129,27 @@ recorded too, so a restore is a **complete revert**.
 Every install takes a ` + "`pre-install`" + ` snapshot automatically, and every restore
 takes a ` + "`pre-restore`" + ` one first — so a restore can itself be undone.
 Same engine as the ` + "`snapshot`" + ` shell command.`,
+
+	tabSessions: `# Sessions
+
+A **desktop session** snapshot (` + "`msh-session`" + `) records the whole graphical
+session: every window with its workspace, monitor, exact position, size and
+state; the program behind it and how to start it again; open files, browser
+tabs, terminal directories and commands, mpv playlists, OBS scenes — and
+**unsaved data** (Kate's never-saved documents come back unsaved; text of
+accessible editors and kitty scrollback is copied to ` + "`<snapshot>/unsaved/`" + `).
+
+| Key | Action |
+|---|---|
+| ` + "`a`" + ` / ` + "`n`" + ` | save the running session (name + note) |
+| ` + "`r`" + ` | **restore**: reuse open windows, launch missing ones, move everything back |
+| ` + "`s`" + ` | **switch**: like restore, but closes windows not in the session (auto-backup first) |
+| ` + "`d`" + ` | delete the snapshot (asks first) |
+| ` + "`enter`" + ` | focus details: every window and its saved state |
+
+Floating windows return to the exact pixel; tiled ones to their workspace.
+Automatic ` + "`auto-pre-switch-*`" + ` snapshots are kept (10 by default).
+Same engine as ` + "`msh-session`" + ` / ` + "`sess`" + ` in the shell — see ` + "`msh-session doctor`" + `.`,
 }
 
 const keysHelp = `# Keys
@@ -160,12 +181,13 @@ Type a command and press ` + "`enter`" + `. ` + "`tab`" + ` completes, ` + "`↑
 
 | Command | Does |
 |---|---|
-| ` + "`addons` `aliases` `functions` `env` `secrets` `dirs` `snapshots`" + ` | switch tab |
+| ` + "`addons` `aliases` `functions` `env` `secrets` `dirs` `snapshots` `sessions`" + ` | switch tab |
 | ` + "`add` `edit` `delete` `toggle`" + ` | act on the selection |
 | ` + "`filter <text>`" + ` / ` + "`clear`" + ` | filter the list |
 | ` + "`all`" + ` | show/hide addon-defined aliases and functions |
 | ` + "`reveal`" + ` | reveal/hide all secrets |
 | ` + "`snapshot [label]`" + ` | create a snapshot |
+| ` + "`session-save [name]`" + ` | save the desktop session |
 | ` + "`edit-config`" + ` / ` + "`edit-local`" + ` | open ` + "`user/msh.conf`" + ` / ` + "`user/local.zsh`" + ` in ` + "`$EDITOR`" + ` |
 | ` + "`reload`" + ` | re-read everything from disk |
 | ` + "`help` / `keys` / `quit`" + ` | … |`
@@ -222,4 +244,13 @@ Absolute path, or ` + "`~/…`" + `. It is added to zoxide (or its score bumped)
 
 Optional **label** (letters, digits, ` + "`. _ -`" + `) appended to the id, e.g.
 ` + "`before-experiment`" + `. Leave empty for a plain timestamp.`,
+
+	"session": `# Save desktop session
+
+**Name** (letters, digits, ` + "`. _ -`" + `), e.g. ` + "`work`" + ` or ` + "`music`" + ` — empty uses a
+timestamp. Saving under an existing name **replaces** it (the old copy goes to
+the store's ` + "`.trash`" + `). **Note** is free text shown in the list.
+
+Saving is read-only for your apps, except that Kate is asked to write its own
+session (that is how its unsaved documents are captured).`,
 }

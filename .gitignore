@@ -18,3 +18,4 @@ ZRC/
 
 # Claude Code worktrees / local settings
 .claude/
+__pycache__/

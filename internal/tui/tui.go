@@ -165,6 +165,16 @@ func (m *model) selectionChanged() tea.Cmd {
 	m.clamp()
 	m.detailKey = "" // force re-render
 	r := m.selected()
+	if r != nil && r.sess != nil {
+		key := "sess:" + r.sess.Name
+		if _, ok := m.snapInfo[key]; !ok {
+			name, p := r.sess.Name, m.p
+			return func() tea.Msg {
+				show, _ := store.SessionCmd(p, "show", name)
+				return snapInfoMsg{key, "## Windows\n\n```\n" + show + "\n```"}
+			}
+		}
+	}
 	if r != nil && r.snap != nil {
 		if _, ok := m.snapInfo[r.snap.ID]; !ok {
 			id, p := r.snap.ID, m.p
@@ -203,7 +213,7 @@ func (m *model) reload(tabs ...int) {
 		if t == tabAddons || t == tabAliases || t == tabFunctions {
 			m.addons = nil
 		}
-		if t == tabSnapshots {
+		if t == tabSnapshots || t == tabSessions {
 			m.snapInfo = map[string]string{}
 		}
 		m.loaded[t] = false
@@ -344,7 +354,7 @@ func (m *model) key(k tea.KeyMsg) tea.Cmd {
 		return m.switchTab(m.tab + 1)
 	case "shift+tab", "left", "h":
 		return m.switchTab(m.tab - 1)
-	case "1", "2", "3", "4", "5", "6", "7":
+	case "1", "2", "3", "4", "5", "6", "7", "8":
 		return m.switchTab(int(s[0] - '1'))
 	case "j", "down":
 		m.cursor[m.tab]++
@@ -397,7 +407,7 @@ func (m *model) key(k tea.KeyMsg) tea.Cmd {
 	case " ":
 		return m.toggle()
 	case "a", "n", "insert":
-		if s == "n" && m.tab != tabSnapshots {
+		if s == "n" && m.tab != tabSnapshots && m.tab != tabSessions {
 			return nil
 		}
 		return m.add()
@@ -424,6 +434,13 @@ func (m *model) key(k tea.KeyMsg) tea.Cmd {
 	case "r":
 		if m.tab == tabSnapshots {
 			return m.restore()
+		}
+		if m.tab == tabSessions {
+			return m.restoreSession(false)
+		}
+	case "s":
+		if m.tab == tabSessions {
+			return m.restoreSession(true)
 		}
 	case "x":
 		if m.tab == tabDirs {
@@ -517,6 +534,8 @@ func (m *model) toggle() tea.Cmd {
 		m.setStatus("zoxide directories have no on/off — d forgets, x excludes forever (F1)", true)
 	case r.snap != nil:
 		m.setStatus("snapshots have no on/off — r restores, d deletes (F1)", true)
+	case r.sess != nil:
+		m.setStatus("sessions have no on/off — r restores, s switches, d deletes (F1)", true)
 	}
 	return nil
 }
@@ -556,6 +575,25 @@ func (m *model) add() tea.Cmd {
 				}
 				return func() tea.Msg {
 					return actionMsg{status: "added " + m.p.Tilde(p), reload: []int{tabDirs}, tab: -1, selKey: "dir:" + p}
+				}, nil
+			})
+	case tabSessions:
+		m.modal = newForm("Save desktop session", "session", []*field{
+			newField("Name", "", "e.g. work, music (empty = timestamp; same name replaces)"),
+			newField("Note", "", "optional")},
+			func(v []string) (tea.Cmd, error) {
+				name, note := strings.TrimSpace(v[0]), strings.TrimSpace(v[1])
+				m.setStatus("saving the desktop session…", false)
+				return func() tea.Msg {
+					args := []string{"save", "-y"}
+					if name != "" {
+						args = append(args, name)
+					}
+					if note != "" {
+						args = append(args, "-m", note)
+					}
+					out, err := store.SessionCmd(m.p, args...)
+					return actionMsg{status: firstLine(out), err: err, reload: []int{tabSessions}, tab: -1}
 				}, nil
 			})
 	case tabSnapshots:
@@ -692,7 +730,7 @@ func (m *model) edit(external bool) tea.Cmd {
 			return m.editor(r.fn.File, "saved "+r.name, tabFunctions)
 		}
 		m.modal = m.funcForm(r.fn, "")
-	case r.snap != nil, r.dir != nil:
+	case r.snap != nil, r.dir != nil, r.sess != nil:
 		m.setStatus("nothing to edit here — F1 shows what you can do", true)
 	}
 	return nil
@@ -755,6 +793,15 @@ func (m *model) remove() tea.Cmd {
 		m.confirm("Forget "+m.p.Tilde(d.Path)+"?", "zoxide forgets it until you visit it again.\nUse x to exclude it forever.", false, func() tea.Cmd {
 			return act("forgot "+m.p.Tilde(d.Path), store.RemoveDir(d.Path), tabDirs)
 		})
+	case r.sess != nil:
+		name := r.sess.Name
+		m.confirm("Delete session "+name+"?", "The snapshot and its saved unsaved-data copies are removed from "+
+			m.p.Tilde(r.sess.Path)+".", true, func() tea.Cmd {
+			return func() tea.Msg {
+				out, err := store.SessionCmd(m.p, "rm", name, "-y")
+				return actionMsg{status: lastLine(out), err: err, reload: []int{tabSessions}, tab: -1}
+			}
+		})
 	case r.snap != nil:
 		id := r.snap.ID
 		m.confirm("Delete snapshot "+id+"?", "This backup is removed permanently from "+m.p.Tilde(m.p.Backup)+".", true, func() tea.Cmd {
@@ -794,6 +841,36 @@ func (m *model) restore() tea.Cmd {
 			}
 		})
 	return nil
+}
+
+// restoreSession restores (or, with switching, switches to) the selected desktop session.
+func (m *model) restoreSession(switching bool) tea.Cmd {
+	r := m.selected()
+	if r == nil || r.sess == nil {
+		return nil
+	}
+	name, verb, body := r.sess.Name, "Restore", "Windows of this session that are open are reused and moved back; "+
+		"missing ones are launched. Nothing else is closed."
+	if switching {
+		verb, body = "Switch to", "Windows that are NOT in this session are closed (apps may ask to save), then it is restored.\n\n"+
+			"The current session is saved as an automatic snapshot first, so you can switch back."
+	}
+	m.confirm(verb+" session "+name+"?", body, switching, func() tea.Cmd {
+		m.setStatus(strings.ToLower(verb)+" "+name+"…", false)
+		return func() tea.Msg {
+			sub := "restore"
+			if switching {
+				sub = "switch"
+			}
+			out, err := store.SessionCmd(m.p, sub, name, "-y")
+			return actionMsg{status: lastLine(out), err: err, reload: []int{tabSessions}, tab: -1}
+		}
+	})
+	return nil
+}
+
+func firstLine(s string) string {
+	return strings.SplitN(strings.TrimSpace(s), "\n", 2)[0]
 }
 
 func (m *model) exclude() tea.Cmd {
@@ -881,6 +958,16 @@ func (m *model) runPalette(cmd, arg string) tea.Cmd {
 			}
 			out, err := store.SnapshotCmd(m.p, args...)
 			return actionMsg{status: lastLine(out), err: err, reload: []int{tabSnapshots}, tab: -1}
+		}
+	case "session-save":
+		m.setStatus("saving the desktop session…", false)
+		return func() tea.Msg {
+			args := []string{"save", "-y"}
+			if arg != "" {
+				args = append(args, arg)
+			}
+			out, err := store.SessionCmd(m.p, args...)
+			return actionMsg{status: firstLine(out), err: err, reload: []int{tabSessions}, tab: -1}
 		}
 	case "edit-config":
 		return m.editor(m.p.ConfFile(), "saved msh.conf — new shells pick it up")
@@ -1005,6 +1092,8 @@ func emptyHint(t int, filtered bool) string {
 		return "zoxide has no directories yet — cd around, or press a"
 	case tabSnapshots:
 		return "no snapshots yet — press a to create one"
+	case tabSessions:
+		return "no desktop sessions yet — press a to save the current one"
 	}
 	return "nothing here"
 }
@@ -1020,6 +1109,10 @@ func (m *model) rowLine(r *row, sel bool, w int) string {
 		mark = sStatusEr.Render("✘ ")
 	case r.snap != nil:
 		mark = sRowDesc.Render("◷ ")
+	case r.sess != nil && r.sess.Active:
+		mark = sOn.Render("● ")
+	case r.sess != nil:
+		mark = sRowDesc.Render("▣ ")
 	case r.dir != nil:
 		mark = sRowDesc.Render("▸ ")
 	}
@@ -1053,7 +1146,7 @@ func (m *model) detailView(w, h int) string {
 	}
 	inner := w - 2
 	r := m.selected()
-	key := ""
+	key := fmt.Sprintf("tab:%d|%d", m.tab, w) // empty tab: show the tab's help, not stale details
 	if r != nil {
 		key = fmt.Sprintf("%s|%d|%v|%v|%d", r.key, w, m.reveal[r.name], m.revealAll, len(m.snapInfo))
 	}
@@ -1090,6 +1183,8 @@ func (m *model) footer() string {
 	switch m.tab {
 	case tabSnapshots:
 		parts = []string{k("a", "create"), k("r", "restore"), k("d", "delete")}
+	case tabSessions:
+		parts = []string{k("a", "save"), k("r", "restore"), k("s", "switch"), k("d", "delete")}
 	case tabDirs:
 		parts = []string{k("enter", "jump"), k("a", "add"), k("d", "forget"), k("x", "exclude"), k("p", "prune")}
 	case tabSecrets:

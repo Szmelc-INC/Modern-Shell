@@ -3,6 +3,7 @@ package store
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -146,6 +147,66 @@ func ListSnapshots(p Paths) ([]Snapshot, error) {
 		snaps = append(snaps, Snapshot{ID: f[0], Created: f[1], Label: f[2], Reason: f[3], Items: n, Size: f[5]})
 	}
 	return snaps, nil
+}
+
+// ── desktop sessions (msh-session) ───────────────────────────────────────
+
+// DesktopSession is one msh-session snapshot of the graphical session.
+type DesktopSession struct {
+	Name    string `json:"name"`
+	Created string `json:"created"`
+	Windows int    `json:"windows"`
+	Unsaved int    `json:"unsaved"`
+	Size    int64  `json:"size"`
+	Note    string `json:"note,omitempty"`
+	Active  bool   `json:"active"`
+	Auto    bool   `json:"auto"`
+	Path    string `json:"path"`
+}
+
+// SessionCmd runs msh-session non-interactively (confirmations pre-approved).
+func SessionCmd(p Paths, args ...string) (string, error) {
+	script := p.SessionScript()
+	if _, err := os.Stat(script); err != nil {
+		if found, lerr := exec.LookPath("msh-session"); lerr == nil {
+			script = found
+		} else {
+			return "", fmt.Errorf("msh-session not found at %s — is Modern Shell installed?", p.Tilde(script))
+		}
+	}
+	cmd := exec.Command("python3", append([]string{script}, args...)...)
+	cmd.Env = append(os.Environ(), "MSH_YES=1", "NO_COLOR=1", "MSH_HOME="+p.Home, "MSH_USER="+p.User)
+	cmd.Stdin = nil
+	out, err := cmd.CombinedOutput()
+	s := strings.TrimRight(string(out), "\n")
+	if err != nil {
+		if s == "" {
+			s = err.Error()
+		}
+		return s, fmt.Errorf("%s", lastNonEmpty(s))
+	}
+	return s, nil
+}
+
+func lastNonEmpty(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	return lines[len(lines)-1]
+}
+
+// ListSessions returns desktop session snapshots (automatic ones too), newest first.
+func ListSessions(p Paths) ([]DesktopSession, error) {
+	out, err := SessionCmd(p, "list", "--all", "--json")
+	if err != nil {
+		return nil, err
+	}
+	var s []DesktopSession
+	if strings.TrimSpace(out) == "" || !strings.HasPrefix(strings.TrimSpace(out), "[") {
+		return s, nil
+	}
+	if err := json.Unmarshal([]byte(out), &s); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 // ── settings (user/msh.conf, simple KEY=value lines) ─────────────────────

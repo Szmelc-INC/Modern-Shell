@@ -42,6 +42,12 @@
               --zsh  <($out/bin/msh completion zsh) \
               --bash <($out/bin/msh completion bash) \
               --fish <($out/bin/msh completion fish)
+            makeWrapper ${pkgs.python3}/bin/python3 $out/bin/msh-session \
+              --add-flags "$share/shell/bin/msh-session"
+            installShellCompletion --cmd msh-session \
+              --zsh  shell/completions/_msh-session \
+              --bash <(${pkgs.python3}/bin/python3 shell/bin/msh-session completion bash) \
+              --fish <(${pkgs.python3}/bin/python3 shell/bin/msh-session completion fish)
             install -Dm644 LICENSE -t $out/share/licenses/modern-shell
             install -Dm644 README.md docs/*.md -t $out/share/doc/modern-shell
           '';

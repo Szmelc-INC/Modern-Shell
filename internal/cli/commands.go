@@ -22,7 +22,7 @@ func Root(version string) *Command {
 		Long: `Without a command, msh opens the interactive TUI (F1 = help, ? = keys, : = commands).
 Every change is written to your layer in ~/.config/msh/user and applies to new shells
 (run 'reload' or 'exec zsh' in an open one).`,
-		Flags: []Flag{{Long: "tab", Short: "t", Arg: "TAB", Help: "TUI: start on a tab (addons, aliases, functions, env, secrets, dirs, snapshots)"}},
+		Flags: []Flag{{Long: "tab", Short: "t", Arg: "TAB", Help: "TUI: start on a tab (addons, aliases, functions, env, secrets, dirs, snapshots, sessions)"}},
 		Examples: []string{
 			"msh                         # open the TUI",
 			"msh addon list --json",
@@ -53,6 +53,7 @@ Every change is written to your layer in ~/.config/msh/user and applies to new s
 		managedCmd(store.KindSecret),
 		dirCmd(),
 		snapshotCmd(),
+		sessionCmd(),
 		{Name: "doctor", Summary: "Check the installation and dependencies", Run: doctor},
 		{Name: "paths", Summary: "Show where msh keeps everything", Run: paths},
 		{Name: "update", Aliases: []string{"install"}, Summary: "Re-run the installer from the recorded source (takes a snapshot first)",
@@ -871,6 +872,86 @@ func snapshotCmd() *Command {
 			{Name: "path", Summary: "Print the snapshot directory", Run: func(c *Ctx, args []string) error { fmt.Fprintln(c.Out, c.P.Backup); return nil }},
 		},
 	}
+}
+
+// ── session (delegates to msh-session) ───────────────────────────────────
+
+func sessionCmd() *Command {
+	mk := func(name, summary, usage, complete string, yes bool, flags []Flag, aliases ...string) *Command {
+		return &Command{Name: name, Aliases: aliases, Summary: summary, Usage: usage, Complete: complete, Flags: flags,
+			Run: func(c *Ctx, args []string) error {
+				a := []string{name}
+				for _, f := range flags {
+					if f.Arg == "" && c.Bool(f.Long) {
+						a = append(a, "--"+f.Long)
+					} else if v := c.Str(f.Long); f.Arg != "" && v != "" {
+						a = append(a, "--"+f.Long, v)
+					}
+				}
+				if yes && c.Yes {
+					a = append(a, "-y")
+				}
+				if c.JSON {
+					a = append(a, "--json")
+				}
+				return runSession(c, append(a, args...)...)
+			}}
+	}
+	dry := Flag{Long: "dry-run", Short: "n", Help: "only show the plan"}
+	only := Flag{Long: "only", Arg: "CLASS", Help: "only these window classes (glob)"}
+	noBackup := Flag{Long: "no-backup", Help: "skip the automatic snapshot taken first"}
+	noState := Flag{Long: "no-state", Help: "windows only: keep workspaces, wallpaper, volume, layout"}
+	return &Command{
+		Name: "session", Aliases: []string{"sess", "desktop"}, Summary: "Desktop session snapshots: windows, apps, unsaved data (msh-session)",
+		Long: "Save the whole graphical session (Hyprland + UWSM) and bring it back or switch between\n" +
+			"sessions. Same engine as the 'msh-session' command and the 'sess' shell function.",
+		Examples: []string{"msh session save work -m 'coding setup'", "msh session switch music", "msh session restore work --dry-run"},
+		Sub: []*Command{
+			mk("save", "Snapshot the running session", "[name]", "", true, []Flag{
+				{Long: "message", Short: "m", Arg: "TEXT", Help: "note stored with it"},
+				{Long: "force", Short: "f", Help: "replace an existing snapshot"},
+				{Long: "no-shots", Help: "skip screenshots"}, only}, "new"),
+			mk("restore", "Reuse open windows, launch the missing ones, put all back", "[name]", "session", true, []Flag{
+				dry, only, noBackup, noState,
+				{Long: "close-others", Help: "close windows not in the snapshot"},
+				{Long: "no-place", Help: "launch only, do not move windows"}}, "load"),
+			mk("switch", "Close windows not in a snapshot, then restore it", "[name]", "session", true, []Flag{
+				dry, only, noBackup, noState,
+				{Long: "keep", Help: "keep windows not in the snapshot"},
+				{Long: "update", Short: "u", Help: "first re-save the active snapshot"}}),
+			mk("list", "List snapshots, newest first", "", "", false, []Flag{
+				{Long: "all", Short: "a", Help: "include automatic snapshots"}}, "ls"),
+			mk("show", "Windows, apps and unsaved data in a snapshot", "[name]", "session", false, nil, "info"),
+			mk("status", "What would be saved right now", "", "", false, nil),
+			mk("diff", "Compare with another snapshot or the live session", "<name> [name]", "session", false, nil),
+			mk("rm", "Delete snapshots", "[name...]", "session", true, nil, "remove", "delete"),
+			mk("prune", "Delete old automatic snapshots", "", "", true, []Flag{{Long: "keep", Arg: "N", Help: "how many to keep (default 5)"}}),
+			mk("doctor", "What can be captured here and how to enable the rest", "", "", false, nil),
+			mk("path", "Print the store or a snapshot directory", "[name]", "session", false, nil),
+		},
+	}
+}
+
+// runSession runs msh-session attached to the terminal (keeps its prompts and pickers).
+func runSession(c *Ctx, args ...string) error {
+	script := c.P.SessionScript()
+	if _, err := os.Stat(script); err != nil {
+		found, lerr := exec.LookPath("msh-session")
+		if lerr != nil {
+			return fmt.Errorf("msh-session not found (%s) — is Modern Shell installed? run ./install.sh", c.P.Tilde(script))
+		}
+		script = found
+	}
+	cmd := exec.Command("python3", append([]string{script}, args...)...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Env = append(os.Environ(), "MSH_HOME="+c.P.Home, "MSH_USER="+c.P.User)
+	if !ui.Color {
+		cmd.Env = append(cmd.Env, "NO_COLOR=1")
+	}
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("session %s failed", args[0])
+	}
+	return nil
 }
 
 // runSnapshot runs the zsh snapshot addon attached to the terminal (keeps its prompts and pickers).

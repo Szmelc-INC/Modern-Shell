@@ -236,6 +236,17 @@ if [[ -n $MSH_BIN && -x $MSH_BIN ]] && (( ! DRY )); then
   fi
   ok "completions: zsh, bash$(command -v fish >/dev/null && echo ', fish')"
 fi
+# msh-session ships its zsh completion in shell/completions; bash/fish are generated.
+if [[ -x $MSH_HOME/bin/msh-session ]] && command -v python3 >/dev/null && (( ! DRY )); then
+  bc=$HOME/.local/share/bash-completion/completions/msh-session
+  in_targets "$bc" || die "guard"
+  mkdir -p "$(dirname "$bc")" && python3 "$MSH_HOME/bin/msh-session" completion bash > "$bc"
+  if command -v fish >/dev/null; then
+    fc=$HOME/.config/fish/completions/msh-session.fish
+    in_targets "$fc" || die "guard"
+    mkdir -p "$(dirname "$fc")" && python3 "$MSH_HOME/bin/msh-session" completion fish > "$fc"
+  fi
+fi
 
 if (( CHSH )) && [[ ${SHELL##*/} != zsh ]] && command -v zsh >/dev/null; then
   ask "Make zsh your login shell? (chsh)" && run chsh -s "$(command -v zsh)" || true

@@ -1,0 +1,2300 @@
+#!/usr/bin/env python3
+"""msh-session — snapshot, restore and switch whole desktop sessions.
+
+Captures everything about the running graphical session — every window with
+its exact workspace/monitor/geometry/state, the program behind it and how to
+start it again, open files, terminal working directories and foreground
+commands, browser tabs, media playlists, and *unsaved* data (Kate stash,
+accessible text widgets of GTK editors, kitty scrollback) — into a directory
+with a human-readable `session.toml`. Restoring re-launches what is missing
+(through `uwsm app` when UWSM manages the session), reuses windows that are
+already open, and puts every window back where it was.
+
+Part of Modern Shell (addon: session). Backend: Hyprland (hyprctl). The
+backend/handler split is deliberate so other compositors can be added later.
+Stdlib only; python-gobject (AT-SPI) and grim are optional.
+"""
+from __future__ import annotations
+
+import argparse
+import configparser
+import fnmatch
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import tarfile
+import time
+import tomllib
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+VERSION = "1.0.0"
+HOME = Path.home()
+XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
+XDG_DATA = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share")
+MSH_HOME = Path(os.environ.get("MSH_HOME") or XDG_CONFIG / "msh")
+MSH_USER = Path(os.environ.get("MSH_USER") or MSH_HOME / "user")
+CONFIG_FILE = Path(os.environ.get("MSH_SESSION_CONFIG") or MSH_USER / "session.toml")
+FORMAT = 1
+
+# Files that must never be read, copied or recorded (secrets wall).
+SECRET_PATHS = [HOME / ".zsh/secure.zsh", HOME / ".zsh/secure.zsh~",
+                HOME / ".zsh/llm-keys.zsh", HOME / ".zsh/BACKUP"]
+SECRET_ARG = re.compile(r"(?i)((?:pass(?:word)?|token|secret|api[-_]?key|auth)[=:])\S+")
+# Environment variables worth recording; everything else stays out of snapshots.
+ENV_ALLOW = re.compile(
+    r"^(XDG_(CURRENT_DESKTOP|SESSION_(TYPE|DESKTOP)|SEAT|VTNR)|WAYLAND_DISPLAY|DISPLAY|"
+    r"HYPRLAND_INSTANCE_SIGNATURE|DESKTOP_SESSION|UWSM_\w+|QT_QPA_PLATFORM(THEME)?|"
+    r"QT_STYLE_OVERRIDE|GTK_THEME|GDK_BACKEND|XCURSOR_(THEME|SIZE)|LANG|LC_\w+|SHELL|TERM|EDITOR|VISUAL|"
+    r"MOZ_ENABLE_WAYLAND|ELECTRON_OZONE_PLATFORM_HINT|QT_LINUX_ACCESSIBILITY_ALWAYS_ON|ACCESSIBILITY_ENABLED)$")
+ENV_DENY = re.compile(r"(?i)(KEY|TOKEN|SECRET|PASS|AUTH|COOKIE|CREDENTIAL)")
+
+DEFAULT_CONFIG = {
+    "store": str(XDG_DATA / "msh/sessions"),
+    "screenshots": True,
+    "clipboard": False,
+    "atspi": True,
+    "hypr_config": True,
+    "launch_timeout": 20.0,
+    "close_timeout": 10.0,
+    "keep_auto": 10,
+    "uwsm": "auto",              # auto | always | never
+    "exclude": [],               # window classes (glob) never saved or touched
+    "launch": {},                # class = "command"  (overrides the detected one)
+}
+
+# ─────────────────────────────── output ────────────────────────────────
+
+class Out:
+    color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+    @classmethod
+    def c(cls, code: str, s: str) -> str:
+        return f"\033[{code}m{s}\033[0m" if cls.color else s
+
+    @classmethod
+    def info(cls, msg): print(cls.c("1;34", "::"), msg, file=sys.stderr)
+
+    @classmethod
+    def ok(cls, msg): print(cls.c("1;32", "✓"), msg, file=sys.stderr)
+
+    @classmethod
+    def warn(cls, msg): print(cls.c("1;33", "!"), msg, file=sys.stderr)
+
+    @classmethod
+    def err(cls, msg): print(cls.c("1;31", "✗"), msg, file=sys.stderr)
+
+
+def die(msg: str, code: int = 1):
+    Out.err(msg)
+    sys.exit(code)
+
+
+def visible_len(s: str) -> int:
+    return len(re.sub(r"\033\[[0-9;]*m", "", s))
+
+
+def table(rows: list[list[str]], head: list[str]):
+    """Print an aligned table; cells may contain color codes."""
+    if not rows:
+        return
+    width = [max(visible_len(str(r[i])) for r in rows + [head]) for i in range(len(head))]
+    cols = shutil.get_terminal_size((160, 20)).columns
+    print("  ".join(Out.c("1;36", h.ljust(width[i])) for i, h in enumerate(head)).rstrip())
+    for r in rows:
+        line = "  ".join(str(c) + " " * (width[i] - visible_len(str(c))) for i, c in enumerate(r)).rstrip()
+        if visible_len(line) > cols and not Out.color:
+            line = line[:cols - 1] + "…"
+        print(line)
+
+
+def confirm(question: str, assume_yes: bool) -> bool:
+    if assume_yes or os.environ.get("MSH_YES") == "1":
+        return True
+    if not sys.stdin.isatty():
+        Out.err("refusing without confirmation (not a terminal); pass -y")
+        return False
+    try:
+        return input(f"{Out.c('1;33', '?')} {question} [y/N] ").strip().lower().startswith("y")
+    except EOFError:
+        return False
+
+
+def human_size(n: int) -> str:
+    for unit in ("B", "K", "M", "G"):
+        if n < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}T"
+
+
+def dir_size(p: Path) -> int:
+    return sum(f.stat().st_size for f in p.rglob("*") if f.is_file() and not f.is_symlink())
+
+# ──────────────────────────────── TOML ─────────────────────────────────
+
+_BARE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _tkey(k: str) -> str:
+    return k if _BARE.match(k) else json.dumps(k, ensure_ascii=False)
+
+
+def _tval(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    if isinstance(v, str):
+        return json.dumps(v, ensure_ascii=False)
+    if isinstance(v, (list, tuple)):
+        return "[" + ", ".join(_tval(x) for x in v if x is not None) + "]"
+    if isinstance(v, dict):
+        return "{ " + ", ".join(f"{_tkey(k)} = {_tval(x)}" for k, x in v.items() if x is not None) + " }"
+    return json.dumps(str(v))
+
+
+def _is_table_array(v) -> bool:
+    return isinstance(v, list) and bool(v) and all(isinstance(x, dict) for x in v)
+
+
+def toml_dumps(data: dict) -> str:
+    out: list[str] = []
+
+    def emit(tbl: dict, path: list[str]):
+        for k, v in tbl.items():
+            if v is None or isinstance(v, dict) or _is_table_array(v):
+                continue
+            out.append(f"{_tkey(k)} = {_tval(v)}")
+        for k, v in tbl.items():
+            if isinstance(v, dict):
+                out.append("")
+                out.append("[" + ".".join(map(_tkey, path + [k])) + "]")
+                emit(v, path + [k])
+            elif _is_table_array(v):
+                for item in v:
+                    out.append("")
+                    out.append("[[" + ".".join(map(_tkey, path + [k])) + "]]")
+                    emit(item, path + [k])
+
+    emit(data, [])
+    return "\n".join(out).lstrip("\n") + "\n"
+
+# ─────────────────────────────── config ────────────────────────────────
+
+def load_config() -> dict:
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    if CONFIG_FILE.is_file():
+        try:
+            user = tomllib.loads(CONFIG_FILE.read_text())
+        except tomllib.TOMLDecodeError as e:
+            die(f"{CONFIG_FILE}: {e}")
+        for k, v in user.items():
+            cfg[k] = v
+    if os.environ.get("MSH_SESSIONS"):
+        cfg["store"] = os.environ["MSH_SESSIONS"]
+    cfg["store"] = Path(os.path.expanduser(str(cfg["store"])))
+    return cfg
+
+
+CONFIG_TEMPLATE = """\
+# msh-session configuration — every key is optional.
+# store          = "~/.local/share/msh/sessions"   # where snapshots live
+# screenshots    = true      # grim screenshot of each visible window + monitor
+# clipboard      = false     # also save/restore the clipboard (may hold secrets!)
+# atspi          = true      # read unsaved text of accessible (GTK/Qt) windows
+# hypr_config    = true      # copy ~/.config/hypr into each snapshot (reference)
+# launch_timeout = 20.0      # seconds to wait for relaunched windows
+# close_timeout  = 10.0      # seconds to wait for closed windows to go away
+# keep_auto      = 10        # automatic pre-switch/pre-restore snapshots kept
+# uwsm           = "auto"    # launch through `uwsm app`: auto | always | never
+# exclude        = ["polkit-*", "xdg-desktop-portal*"]   # classes never touched
+#
+# [launch]                   # override the command used to relaunch a class
+# discord = "discord"
+"""
+
+# ──────────────────────────── /proc helpers ────────────────────────────
+
+def is_secret_path(p: str | Path | None) -> bool:
+    if not p:
+        return False
+    try:
+        rp = Path(os.path.expanduser(str(p))).resolve()
+    except (OSError, RuntimeError):
+        return False
+    for s in SECRET_PATHS:
+        if rp == s or s in rp.parents or fnmatch.fnmatch(str(rp), str(s) + "*"):
+            return True
+    return False
+
+
+def argv_mentions_secret(argv: list[str], cwd: str | None = None) -> bool:
+    for a in argv:
+        if "secure.zsh" in a or "llm-keys" in a:
+            return True
+        if cwd and not a.startswith("-") and is_secret_path(os.path.join(cwd, a)):
+            return True
+    return False
+
+
+def redact_argv(argv: list[str]) -> list[str]:
+    return [SECRET_ARG.sub(r"\1***", a) for a in argv]
+
+
+def proc_read(pid: int, name: str) -> bytes:
+    try:
+        return Path(f"/proc/{pid}/{name}").read_bytes()
+    except OSError:
+        return b""
+
+
+def proc_cmdline(pid: int) -> list[str]:
+    raw = proc_read(pid, "cmdline")
+    parts = [p.decode(errors="replace") for p in raw.split(b"\0")]
+    while parts and parts[-1] == "":
+        parts.pop()
+    # Some programs (Electron, setproctitle) overwrite argv with one padded string.
+    if len(parts) == 1 and " " in parts[0].strip() and not Path(parts[0].split()[0]).exists():
+        parts = [parts[0].strip()]
+    return [p.rstrip() if i == 0 else p for i, p in enumerate(parts)]
+
+
+def proc_link(pid: int, name: str) -> str | None:
+    try:
+        return os.readlink(f"/proc/{pid}/{name}")
+    except OSError:
+        return None
+
+
+def proc_env(pid: int, keys: set[str]) -> dict[str, str]:
+    """Read only the listed environment variables of a process (never all)."""
+    env = {}
+    for item in proc_read(pid, "environ").split(b"\0"):
+        k, _, v = item.partition(b"=")
+        ks = k.decode(errors="replace")
+        if ks in keys:
+            env[ks] = v.decode(errors="replace")
+    return env
+
+
+class ProcTable:
+    """Snapshot of /proc: parent/child links, process groups, terminals."""
+
+    def __init__(self):
+        self.ppid: dict[int, int] = {}
+        self.pgrp: dict[int, int] = {}
+        self.tpgid: dict[int, int] = {}
+        self.tty: dict[int, int] = {}
+        self.comm: dict[int, str] = {}
+        self.children: dict[int, list[int]] = {}
+        for d in Path("/proc").iterdir():
+            if not d.name.isdigit():
+                continue
+            try:
+                stat = (d / "stat").read_text()
+            except OSError:
+                continue
+            pid = int(d.name)
+            lp, rp = stat.find("("), stat.rfind(")")
+            fields = stat[rp + 2:].split()
+            self.comm[pid] = stat[lp + 1:rp]
+            self.ppid[pid] = int(fields[1])
+            self.pgrp[pid] = int(fields[2])
+            self.tty[pid] = int(fields[4])
+            self.tpgid[pid] = int(fields[5])
+            self.children.setdefault(int(fields[1]), []).append(pid)
+        for v in self.children.values():
+            v.sort()
+
+    def foreground(self, shell: int) -> int | None:
+        """The foreground process of the terminal a shell runs on (if not the shell)."""
+        tp = self.tpgid.get(shell, -1)
+        if tp <= 0 or tp == self.pgrp.get(shell):
+            return None
+        stack, best = list(self.children.get(shell, [])), None
+        while stack:
+            p = stack.pop(0)
+            if self.pgrp.get(p) == tp:
+                if best is None:
+                    best = p
+                if p == tp:
+                    return p
+            stack.extend(self.children.get(p, []))
+        return best
+
+
+SKIP_FILE_PREFIX = ("/proc", "/sys", "/dev", "/run", "/tmp", "/var", "/usr", "/opt", "/etc",
+                    "/memfd", "/nix", "/snap")
+
+
+def proc_open_files(pid: int, limit: int = 40) -> list[str]:
+    """Regular user files a process has open (documents, media), secrets excluded."""
+    found: list[str] = []
+    hidden = (str(HOME / ".cache"), str(HOME / ".config"), str(HOME / ".local"),
+              str(HOME / ".mozilla"), str(HOME / ".var"))
+    try:
+        fds = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        return found
+    for fd in fds:
+        t = proc_link(pid, f"fd/{fd}")
+        if not t or not t.startswith("/") or t.endswith(" (deleted)") or t.startswith(SKIP_FILE_PREFIX):
+            continue
+        if t.startswith(hidden) or "/." in t[len(str(HOME)):] or is_secret_path(t):
+            continue
+        if os.path.isfile(t) and t not in found:
+            found.append(t)
+        if len(found) >= limit:
+            break
+    return sorted(found)
+
+# ────────────────────────── desktop entries ────────────────────────────
+
+_DESKTOP_CACHE: list[dict] | None = None
+
+
+def desktop_entries() -> list[dict]:
+    global _DESKTOP_CACHE
+    if _DESKTOP_CACHE is not None:
+        return _DESKTOP_CACHE
+    dirs = [XDG_DATA] + [Path(d) for d in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":")]
+    entries, seen = [], set()
+    for d in dirs:
+        for f in sorted((d / "applications").glob("**/*.desktop")):
+            if f.name in seen:
+                continue
+            seen.add(f.name)
+            cp = configparser.ConfigParser(interpolation=None, strict=False)
+            try:
+                cp.read(f, encoding="utf-8")
+                sec = cp["Desktop Entry"]
+            except (configparser.Error, KeyError, UnicodeDecodeError):
+                continue
+            if sec.get("Exec"):
+                entries.append({"id": f.stem, "path": str(f), "exec": sec.get("Exec"),
+                                "wmclass": sec.get("StartupWMClass", ""), "name": sec.get("Name", "")})
+    _DESKTOP_CACHE = entries
+    return entries
+
+
+def desktop_for_class(cls: str) -> dict | None:
+    c = cls.lower()
+    entries = desktop_entries()
+    for test in (lambda e: e["wmclass"].lower() == c,
+                 lambda e: e["id"].lower() == c,
+                 lambda e: e["id"].lower().endswith("." + c) or e["id"].lower().split(".")[-1] == c,
+                 lambda e: c.split("-")[0] and e["id"].lower() == c.split("-")[0]):
+        for e in entries:
+            if test(e):
+                return e
+    return None
+
+
+def desktop_argv(entry: dict) -> list[str]:
+    argv = [a for a in shlex.split(entry["exec"]) if not re.fullmatch(r"%[a-zA-Z]", a)]
+    return [re.sub(r"%[a-zA-Z]", "", a) for a in argv]
+
+
+def resolvable(argv0: str) -> bool:
+    return bool(argv0) and ((os.path.isabs(argv0) and os.access(argv0, os.X_OK)) or shutil.which(argv0) is not None)
+
+# ─────────────────────────── Hyprland backend ──────────────────────────
+
+class Hyprland:
+    name = "hyprland"
+
+    @staticmethod
+    def available() -> bool:
+        return bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")) and shutil.which("hyprctl") is not None
+
+    @staticmethod
+    def j(what: str):
+        r = subprocess.run(["hyprctl", "-j", what], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            raise RuntimeError(f"hyprctl {what}: {r.stderr.strip() or r.stdout.strip()}")
+        try:
+            return json.loads(r.stdout or "null")
+        except json.JSONDecodeError:
+            return r.stdout
+
+    @staticmethod
+    def raw(*args: str) -> str:
+        r = subprocess.run(["hyprctl", *args], capture_output=True, text=True, timeout=10)
+        return r.stdout
+
+    def clients(self) -> list[dict]:
+        return [c for c in self.j("clients") if c.get("mapped", True) and c.get("address")]
+
+    def batch(self, cmds: list[str]) -> None:
+        if not cmds:
+            return
+        for i in range(0, len(cmds), 40):
+            subprocess.run(["hyprctl", "--batch", " ; ".join(cmds[i:i + 40])],
+                           capture_output=True, text=True, timeout=15)
+
+    def dispatch(self, *args: str) -> str:
+        return subprocess.run(["hyprctl", "dispatch", *args], capture_output=True, text=True, timeout=10).stdout.strip()
+
+    def exec(self, argv: list[str], env: dict[str, str] | None = None) -> None:
+        cmd = shlex.join(argv)
+        if env:
+            cmd = "env " + " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()) + " " + cmd
+        self.dispatch("exec", cmd)
+
+# ───────────────────────────── snapshot store ──────────────────────────
+
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+class Store:
+    def __init__(self, root: Path):
+        self.root = root
+
+    def ensure(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.root, 0o700)
+
+    def path(self, name: str) -> Path:
+        return self.root / name
+
+    def names(self, include_auto: bool = True) -> list[str]:
+        if not self.root.is_dir():
+            return []
+        out = []
+        for d in self.root.iterdir():
+            if d.is_dir() and (d / "session.toml").is_file() and not d.name.startswith("."):
+                if include_auto or not d.name.startswith("auto-"):
+                    out.append(d.name)
+        return sorted(out, key=lambda n: (self.path(n) / "session.toml").stat().st_mtime, reverse=True)
+
+    def load(self, name: str) -> dict:
+        f = self.path(name) / "session.toml"
+        if not f.is_file():
+            die(f"no such session snapshot: {name}  (see: msh-session list)")
+        return tomllib.loads(f.read_text())
+
+    def resolve(self, ref: str | None, pick: bool = True, include_auto: bool = True) -> str:
+        names = self.names(include_auto)
+        if ref is None:
+            if pick:
+                return self.pick(names)
+            die("no snapshot given")
+        if ref.startswith("#") and ref[1:].isdigit():
+            i = int(ref[1:]) - 1
+            if 0 <= i < len(names):
+                return names[i]
+            die(f"no snapshot {ref}")
+        if ref == "@active":
+            a = self.active()
+            return a or die("no active session recorded")
+        if not self.path(ref).joinpath("session.toml").is_file():
+            matches = [n for n in names if n.startswith(ref)]
+            if len(matches) == 1:
+                return matches[0]
+            die(f"no such session snapshot: {ref}")
+        return ref
+
+    def pick(self, names: list[str]) -> str:
+        if not names:
+            die("no session snapshots yet — create one with: msh-session save <name>")
+        if shutil.which("fzf") and sys.stdin.isatty():
+            me = shlex.quote(sys.argv[0])
+            r = subprocess.run(["fzf", "--height=60%", "--reverse", "--prompt=session> ",
+                                "--preview", f"{me} show {{}} --no-files", "--preview-window=right,65%"],
+                               input="\n".join(names), capture_output=False, stdout=subprocess.PIPE, text=True)
+            choice = r.stdout.strip()
+            if not choice:
+                sys.exit(130)
+            return choice
+        for i, n in enumerate(names, 1):
+            print(f"  {Out.c('1;35', f'#{i}')} {n}", file=sys.stderr)
+        try:
+            ans = input("pick #: ").strip().lstrip("#")
+        except EOFError:
+            sys.exit(130)
+        if ans.isdigit() and 1 <= int(ans) <= len(names):
+            return names[int(ans) - 1]
+        die("invalid choice")
+
+    def active(self) -> str | None:
+        f = self.root / ".active"
+        return f.read_text().strip() if f.is_file() else None
+
+    def set_active(self, name: str):
+        self.ensure()
+        (self.root / ".active").write_text(name + "\n")
+
+# ─────────────────────────────── handlers ──────────────────────────────
+# A handler knows one family of programs: how to capture its inner state
+# (documents, tabs, unsaved buffers) and how to start it again.
+
+
+class Ctx:
+    """Shared state of one capture or restore run."""
+
+    def __init__(self, cfg: dict, wm: Hyprland, snapdir: Path | None, name: str = ""):
+        self.cfg, self.wm, self.dir, self.name = cfg, wm, snapdir, name
+        self.procs = ProcTable()
+        self.notes: list[str] = []
+        self.done: set[str] = set()     # per-app one-shot work (kate flush, browser copy)
+        self.data: dict = {}
+        self.restoring = False          # True only while restoring (launch may write app state)
+
+    def sub(self, *parts: str) -> Path:
+        p = self.dir.joinpath(*parts)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+
+class Handler:
+    key = "generic"
+    classes: tuple[str, ...] = ()
+
+    def match(self, cls: str) -> bool:
+        c = cls.lower()
+        return any(fnmatch.fnmatch(c, pat) for pat in self.classes)
+
+    def capture(self, ctx: Ctx, client: dict, win: dict) -> None:
+        pass
+
+    def launch(self, ctx: Ctx, win: dict) -> list[str] | None:
+        """argv to start this window again (None = generic resolution)."""
+        return None
+
+    def same(self, spec: dict, client: dict, argv: list[str]) -> bool:
+        """May this live window stand in for the snapshot window (reuse instead of launch)?"""
+        return client.get("title") == spec.get("title") or (bool(argv) and argv == spec.get("proc", {}).get("cmdline"))
+
+    def launch_group(self, win: dict) -> str | None:
+        """Windows with the same group key are started by one launch."""
+        return None
+
+    def prepare(self, ctx: Ctx, win: dict, reused: dict | None) -> None:
+        """Runs before launching (or for a reused window) — e.g. load app sessions."""
+
+    def after(self, ctx: Ctx, win: dict, client: dict) -> None:
+        """Runs once the window exists and is placed."""
+
+
+def generic_launch(ctx: Ctx, win: dict) -> list[str] | None:
+    """Best way to start a program again: config > cmdline > AppImage > desktop file > exe."""
+    proc = win.get("proc", {})
+    override = ctx.cfg.get("launch", {}).get(win["class"]) or ctx.cfg.get("launch", {}).get(win["class"].lower())
+    if override:
+        return shlex.split(override)
+    argv = proc.get("cmdline") or []
+    if proc.get("appimage") and os.path.exists(proc["appimage"]):
+        return [proc["appimage"], *argv[1:]]
+    if argv and resolvable(argv[0]) and not proc.get("exe", "").startswith("/tmp/.mount_"):
+        return argv
+    entry = desktop_for_class(win["class"]) or desktop_for_class(win.get("initial_class", ""))
+    if entry:
+        return desktop_argv(entry)
+    exe = proc.get("exe")
+    if exe and os.access(exe, os.X_OK) and not exe.startswith("/tmp/"):
+        return [exe] + argv[1:]
+    return None
+
+
+class TerminalHandler(Handler):
+    key = "terminal"
+    classes = ("kitty", "foot", "footclient", "alacritty", "org.wezfurlong.wezterm", "com.mitchellh.ghostty",
+               "xterm", "konsole", "org.kde.konsole")
+    SHELLS = {"zsh", "bash", "fish", "sh", "dash", "nu", "xonsh", "elvish", "tcsh", "ksh"}
+    EDITORS = {"nano", "vim", "nvim", "vi", "micro", "hx", "helix", "emacs", "kak", "mcedit", "ne", "joe"}
+
+    def capture(self, ctx: Ctx, client: dict, win: dict) -> None:
+        pt, pid = ctx.procs, client["pid"]
+        tabs = []
+        for child in pt.children.get(pid, []):
+            if not pt.tty.get(child):
+                continue                  # helpers without a terminal (kitten __atexit__ …)
+            comm = pt.comm.get(child, "")
+            if comm.lstrip("-") not in self.SHELLS:
+                # A terminal started with a command (kitty -e htop) and no shell.
+                argv = proc_cmdline(child)
+                cwd = proc_link(child, "cwd")
+                if argv_mentions_secret(argv, cwd):
+                    tabs.append({"cwd": cwd or str(HOME), "redacted": True})
+                    continue
+                tabs.append({"cwd": cwd or str(HOME), "command": redact_argv(argv), "shell": ""})
+                continue
+            cwd = proc_link(child, "cwd") or str(HOME)
+            tab = {"cwd": "~" if cwd == str(HOME) else cwd, "shell": comm.lstrip("-")}
+            if is_secret_path(cwd):
+                tab["cwd"] = "~"
+            fg = pt.foreground(child)
+            if fg:
+                argv = proc_cmdline(fg)
+                fcwd = proc_link(fg, "cwd") or cwd
+                if argv_mentions_secret(argv, fcwd):
+                    tab["redacted"] = True
+                else:
+                    tab["command"] = redact_argv(argv)
+                    if fcwd != cwd:
+                        tab["command_cwd"] = fcwd
+                    base = Path(argv[0]).name if argv else ""
+                    if base in self.EDITORS:
+                        files = [os.path.join(fcwd, a) for a in argv[1:] if not a.startswith(("-", "+"))]
+                        tab["editor"] = base
+                        tab["editor_files"] = files
+                        tab["unsaved"] = "unknown — terminal editors keep buffers in their own memory"
+            tabs.append(tab)
+        win["app"] = {"handler": self.key, "tabs": tabs}
+        self._kitty_text(ctx, client, win, tabs)
+
+    def same(self, spec: dict, client: dict, argv: list[str]) -> bool:
+        if client.get("title") == spec.get("title"):
+            return True
+        pt = ProcTable()
+        live = {proc_link(c, "cwd") for c in pt.children.get(client.get("pid", -1), []) if pt.tty.get(c)}
+        want = {os.path.expanduser(t.get("cwd", "~")) for t in spec.get("app", {}).get("tabs", [])}
+        return bool(live & want) and argv == spec.get("proc", {}).get("cmdline")
+
+    def _kitty_text(self, ctx: Ctx, client: dict, win: dict, tabs: list[dict]) -> None:
+        """With kitty remote control on, save each window's full scrollback."""
+        if win["class"].lower() != "kitty" or not shutil.which("kitty") or ctx.dir is None:
+            return
+        sock = None
+        for child in ctx.procs.children.get(client["pid"], []):
+            sock = proc_env(child, {"KITTY_LISTEN_ON"}).get("KITTY_LISTEN_ON")
+            if sock:
+                break
+        if not sock:
+            win["app"]["scrollback"] = "unavailable (kitty remote control off — see: msh-session doctor)"
+            return
+        try:
+            r = subprocess.run(["kitty", "@", "--to", sock, "ls"], capture_output=True, text=True, timeout=5)
+            data = json.loads(r.stdout)
+        except (OSError, json.JSONDecodeError, subprocess.TimeoutExpired):
+            return
+        out = ctx.sub("unsaved", win["id"])
+        n = 0
+        for osw in data:
+            for tab in osw.get("tabs", []):
+                for w in tab.get("windows", []):
+                    if w.get("pid") and any(argv_mentions_secret(fp.get("cmdline", []), fp.get("cwd"))
+                                            for fp in w.get("foreground_processes", [])):
+                        continue
+                    t = subprocess.run(["kitty", "@", "--to", sock, "get-text", "--extent", "all",
+                                        "--match", f"id:{w['id']}"], capture_output=True, text=True, timeout=5)
+                    if t.returncode == 0 and t.stdout.strip():
+                        n += 1
+                        (out / f"kitty-window-{w['id']}.txt").write_text(t.stdout)
+        win["app"]["scrollback"] = f"{n} window(s) saved" if n else "empty"
+
+    def launch(self, ctx: Ctx, win: dict) -> list[str] | None:
+        cls = win["class"].lower()
+        tabs = win.get("app", {}).get("tabs") or [{"cwd": "~"}]
+        base = (win.get("proc", {}).get("cmdline") or [cls])
+        keep = []
+        i = 1
+        while i < len(base):        # keep identity flags (class/title/config), drop commands
+            a = base[i]
+            if a in ("--class", "--name", "-T", "--title", "-c", "--config", "-o", "--override", "--app-id"):
+                keep += base[i:i + 2]
+                i += 2
+                continue
+            if a.startswith(("--class=", "--name=", "--title=", "--config=", "--override=", "--app-id=")):
+                keep.append(a)
+            if a in ("-e", "--", "--hold", "--session") or not a.startswith("-"):
+                break
+            i += 1
+        prog = base[0] if resolvable(base[0]) else (shutil.which(cls) or cls)
+        if cls == "kitty":
+            sess = ctx.sub("apps", "kitty") / f"{win['id']}.kitty-session"
+            sess.write_text(self.kitty_session(tabs))
+            return [prog, *keep, "--session", str(sess)]
+        t = tabs[0]
+        cwd = os.path.expanduser(t.get("cwd", "~"))
+        cmd = self.shell_cmd(t)
+        flag = {"foot": "-D", "footclient": "-D", "alacritty": "--working-directory",
+                "org.wezfurlong.wezterm": None, "konsole": "--workdir", "org.kde.konsole": "--workdir"}.get(cls)
+        argv = [prog, *keep]
+        if cls == "org.wezfurlong.wezterm":
+            argv += ["start", "--cwd", cwd]
+        elif cls == "com.mitchellh.ghostty":
+            argv += [f"--working-directory={cwd}"]
+        elif flag:
+            argv += [flag, cwd]
+        if cmd:
+            argv += ["-e", *cmd]
+        return argv
+
+    @staticmethod
+    def shell_cmd(tab: dict) -> list[str] | None:
+        if tab.get("redacted") or not tab.get("command"):
+            return None
+        shell = tab.get("shell") or ""
+        if not shell:
+            return tab["command"]
+        line = shlex.join(tab["command"])
+        if tab.get("command_cwd"):
+            line = f"cd {shlex.quote(os.path.expanduser(tab['command_cwd']))} && {line}"
+        return [shell, "-ic", f"{line}; exec {shell} -i"]
+
+    def kitty_session(self, tabs: list[dict]) -> str:
+        lines = ["# generated by msh-session"]
+        for i, t in enumerate(tabs):
+            lines.append("new_tab" if i else "")
+            lines.append(f"cd {os.path.expanduser(t.get('cwd', '~'))}")
+            cmd = self.shell_cmd(t)
+            lines.append("launch" + (" " + shlex.join(cmd) if cmd else ""))
+        return "\n".join(l for l in lines if l) + "\n"
+
+
+class KateHandler(Handler):
+    """Kate keeps unsaved documents in its session *stash*; we force a flush
+    over D-Bus, copy session + stash, and restore them as a separate Kate
+    session (`msh-<snapshot>`), so unsaved documents come back unsaved."""
+    key = "kate"
+    classes = ("org.kde.kate", "kate")
+    KDATA = XDG_DATA / "kate"
+
+    @staticmethod
+    def qdbus() -> str | None:
+        return shutil.which("qdbus6") or shutil.which("qdbus")
+
+    def bus(self, pid: int, *args: str) -> str:
+        q = self.qdbus()
+        if not q:
+            return ""
+        r = subprocess.run([q, f"org.kde.kate-{pid}", *args], capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+    def capture(self, ctx: Ctx, client: dict, win: dict) -> None:
+        pid = client["pid"]
+        app = {"handler": self.key}
+        win["app"] = app
+        session = self.bus(pid, "/MainApplication", "org.kde.Kate.Application.activeSession")
+        if not session:
+            app["note"] = "Kate D-Bus not reachable; documents taken from open files only"
+            app["documents"] = [{"url": f} for f in win.get("proc", {}).get("open_files", [])]
+            return
+        app["session"] = session
+        key = f"kate:{pid}"
+        if key not in ctx.done:
+            ctx.done.add(key)
+            mw = [p for p in self.bus(pid).splitlines() if re.fullmatch(r"/kate/MainWindow_\d+", p.strip())]
+            if mw:
+                self.bus(pid, mw[0].strip(), "org.kde.KMainWindow.activateAction", "sessions_save")
+                time.sleep(0.4)
+            dst = ctx.sub("apps", "kate", str(pid))
+            sfile = self.KDATA / "sessions" / f"{session}.katesession"
+            stash = self.KDATA / "stash" / f"{session}.katesession"
+            if sfile.is_file():
+                shutil.copy2(sfile, dst / "session.katesession")
+            if stash.is_dir():
+                shutil.copytree(stash, dst / "stash", dirs_exist_ok=True)
+            ctx.data[key] = self.parse(dst, session)
+        docs = ctx.data.get(key, [])
+        app["data"] = f"apps/kate/{pid}"
+        app["documents"] = docs
+        app["unsaved"] = sum(1 for d in docs if d.get("stashed"))
+        # Plain-text copies of every unsaved buffer, readable without Kate.
+        out = None
+        for i, d in enumerate(docs):
+            if d.get("stashed"):
+                src = ctx.dir / app["data"] / "stash" / d["stashed"]
+                if src.is_file():
+                    out = out or ctx.sub("unsaved", win["id"])
+                    name = Path(d["url"]).name if d.get("url") else f"untitled-{i + 1}.txt"
+                    shutil.copy2(src, out / f"kate-{i + 1:02d}-{name}")
+
+    @staticmethod
+    def parse(dst: Path, session: str) -> list[dict]:
+        f = dst / "session.katesession"
+        if not f.is_file():
+            return []
+        cp = configparser.ConfigParser(interpolation=None, strict=False)
+        cp.optionxform = str
+        try:
+            cp.read(f, encoding="utf-8")
+        except configparser.Error:
+            return []
+        docs = []
+        for sec in sorted((s for s in cp.sections() if re.fullmatch(r"Document \d+", s)),
+                          key=lambda s: int(s.split()[1])):
+            url = cp[sec].get("URL", "")
+            stashed = cp[sec].get("stashedFile", "")
+            path = unquote(urlparse(url).path) if url.startswith("file:") else url
+            if is_secret_path(path):
+                continue
+            d = {"url": path} if path else {}
+            if stashed:
+                d["stashed"] = Path(stashed).name
+                d["state"] = "modified" if path else "new-unsaved"
+            docs.append(d)
+        return docs
+
+    def launch_group(self, win: dict) -> str | None:
+        return "kate:" + str(win.get("app", {}).get("data", ""))
+
+    def same(self, spec: dict, client: dict, argv: list[str]) -> bool:
+        return True         # one Kate instance; its documents come from the session switch
+
+    def target_session(self, ctx: Ctx) -> str:
+        return f"msh-{ctx.name}"
+
+    def install_session(self, ctx: Ctx, win: dict) -> str | None:
+        data = win.get("app", {}).get("data")
+        src = ctx.dir / data if data else None
+        if not src or not (src / "session.katesession").is_file():
+            return None
+        target = self.target_session(ctx)
+        orig = win["app"].get("session", "")
+        sessions, stash = self.KDATA / "sessions", self.KDATA / "stash" / f"{target}.katesession"
+        sessions.mkdir(parents=True, exist_ok=True)
+        text = (src / "session.katesession").read_text()
+        text = text.replace(f"/stash/{orig}.katesession/", f"/stash/{target}.katesession/")
+        (sessions / f"{target}.katesession").write_text(text)
+        if stash.exists():
+            shutil.rmtree(stash)
+        if (src / "stash").is_dir():
+            shutil.copytree(src / "stash", stash)
+        return target
+
+    def prepare(self, ctx: Ctx, win: dict, reused: dict | None) -> None:
+        if reused is None:
+            return
+        target = self.install_session(ctx, win)
+        if not target:
+            return
+        current = self.bus(reused["pid"], "/MainApplication", "org.kde.Kate.Application.activeSession")
+        if current != target:
+            # Kate stashes the current session's unsaved docs, then loads ours.
+            self.bus(reused["pid"], "/MainApplication", "org.kde.Kate.Application.activateSession", target)
+
+    def launch(self, ctx: Ctx, win: dict) -> list[str] | None:
+        if ctx.restoring:
+            target = self.install_session(ctx, win)
+        else:
+            target = self.target_session(ctx) if win.get("app", {}).get("data") else None
+        argv = ["kate"]
+        if "-b" in win.get("proc", {}).get("cmdline", []):
+            argv.append("-b")
+        if target:
+            argv += ["-s", target]
+        else:
+            argv += [d["url"] for d in win.get("app", {}).get("documents", []) if d.get("url")]
+        return argv
+
+
+class ChromiumHandler(Handler):
+    """Chromium-family browsers: tabs per window from the SNSS session log."""
+    key = "chromium"
+    classes = ("thorium-browser", "thorium", "chromium", "google-chrome*", "brave-browser*",
+               "vivaldi*", "microsoft-edge*", "opera", "cromite")
+    PROFILE_DIRS = {"thorium": "thorium", "chromium": "chromium", "google-chrome": "google-chrome",
+                    "brave-browser": "BraveSoftware/Brave-Browser", "vivaldi": "vivaldi",
+                    "microsoft-edge": "microsoft-edge", "opera": "opera", "cromite": "cromite"}
+
+    def profile(self, cls: str) -> Path | None:
+        c = cls.lower()
+        for k, v in self.PROFILE_DIRS.items():
+            if c.startswith(k):
+                p = XDG_CONFIG / v / "Default"
+                return p if p.is_dir() else None
+        return None
+
+    def capture(self, ctx: Ctx, client: dict, win: dict) -> None:
+        app = {"handler": self.key}
+        win["app"] = app
+        prof = self.profile(win["class"])
+        if not prof:
+            return
+        key = f"chromium:{prof}"
+        if key not in ctx.done:
+            ctx.done.add(key)
+            sess = prof / "Sessions"
+            files = sorted(sess.glob("Session_*"), key=lambda f: f.stat().st_mtime) if sess.is_dir() else []
+            windows = []
+            if files:
+                dst = ctx.sub("apps", "browser", win["class"])
+                for f in sorted(sess.iterdir(), key=lambda f: f.stat().st_mtime)[-4:]:
+                    shutil.copy2(f, dst / f.name)
+                try:
+                    windows = parse_snss(files[-1].read_bytes())
+                except Exception as e:  # noqa: BLE001 — a damaged log must not abort a snapshot
+                    ctx.notes.append(f"{win['class']}: could not parse session log ({e})")
+            ctx.data[key] = {"windows": windows, "used": set()}
+        state = ctx.data[key]
+        title = re.sub(r"\s+[-–—]\s+[^-–—]+$", "", client.get("title", ""))
+        pick = None
+        for i, w in enumerate(state["windows"]):
+            if i not in state["used"] and w["tabs"] and title and any(
+                    t["title"] == title for t in w["tabs"][w["selected"]:w["selected"] + 1]):
+                pick = i
+                break
+        if pick is None:
+            free = [i for i, w in enumerate(state["windows"]) if i not in state["used"] and w["tabs"]]
+            pick = free[0] if free else None
+        if pick is not None:
+            state["used"].add(pick)
+            w = state["windows"][pick]
+            app["tabs"] = [{"url": t["url"], "title": t["title"], **({"pinned": True} if t.get("pinned") else {})}
+                           for t in w["tabs"]]
+            app["active_tab"] = w["selected"]
+        app["unsaved"] = "form contents are not captured (would need remote debugging)"
+
+    def same(self, spec: dict, client: dict, argv: list[str]) -> bool:
+        return client.get("title") == spec.get("title")
+
+    def launch(self, ctx: Ctx, win: dict) -> list[str] | None:
+        entry = desktop_for_class(win["class"])
+        argv = desktop_argv(entry) if entry else None
+        if not argv:
+            argv = generic_launch(ctx, win) or [win["class"].lower()]
+            argv = [argv[0]]
+        urls = [t["url"] for t in win.get("app", {}).get("tabs", []) if t.get("url")]
+        return argv + ["--new-window", *urls]
+
+
+def parse_snss(data: bytes) -> list[dict]:
+    """Minimal reader of Chromium's SNSS session command log."""
+    if data[:4] != b"SNSS":
+        raise ValueError("not an SNSS file")
+    pos = 8
+    tabs: dict[int, dict] = {}
+    wins: dict[int, dict] = {}
+    closed_w: set[int] = set()
+
+    def tab(tid: int) -> dict:
+        return tabs.setdefault(tid, {"window": None, "index": 0, "navs": {}, "sel": 0, "pinned": False})
+
+    def pstr(b: bytes, o: int, wide: bool) -> tuple[str, int]:
+        n = struct.unpack_from("<i", b, o)[0]
+        o += 4
+        size = n * 2 if wide else n
+        s = b[o:o + size].decode("utf-16-le" if wide else "utf-8", errors="replace")
+        o += (size + 3) & ~3
+        return s, o
+
+    while pos + 3 <= len(data):
+        size = struct.unpack_from("<H", data, pos)[0]
+        if size == 0 or pos + 2 + size > len(data):
+            break
+        cid, p = data[pos + 2], data[pos + 3:pos + 2 + size]
+        pos += 2 + size
+        try:
+            if cid == 0 and len(p) >= 8:                      # SetTabWindow
+                w, t = struct.unpack_from("<ii", p)
+                tab(t)["window"] = w
+                wins.setdefault(w, {"sel": 0})
+            elif cid == 2 and len(p) >= 8:                    # SetTabIndexInWindow
+                t, i = struct.unpack_from("<ii", p)
+                tab(t)["index"] = i
+            elif cid == 6:                                    # UpdateTabNavigation (pickle)
+                o = 4
+                t, idx = struct.unpack_from("<ii", p, o)
+                o += 8
+                url, o = pstr(p, o, False)
+                title, o = pstr(p, o, True)
+                tab(t)["navs"][idx] = (url, title)
+            elif cid == 7 and len(p) >= 8:                    # SetSelectedNavigationIndex
+                t, i = struct.unpack_from("<ii", p)
+                tab(t)["sel"] = i
+            elif cid == 8 and len(p) >= 8:                    # SetSelectedTabInIndex
+                w, i = struct.unpack_from("<ii", p)
+                wins.setdefault(w, {"sel": 0})["sel"] = i
+            elif cid == 12 and len(p) >= 5:                   # SetPinnedState
+                t = struct.unpack_from("<i", p)[0]
+                tab(t)["pinned"] = bool(p[4])
+            elif cid == 16 and len(p) >= 4:                   # TabClosed
+                tabs.pop(struct.unpack_from("<i", p)[0], None)
+            elif cid == 17 and len(p) >= 4:                   # WindowClosed
+                closed_w.add(struct.unpack_from("<i", p)[0])
+        except struct.error:
+            continue
+    out = []
+    for wid, w in wins.items():
+        if wid in closed_w:
+            continue
+        ts = sorted((t for t in tabs.values() if t["window"] == wid and t["navs"]), key=lambda t: t["index"])
+        items = []
+        for t in ts:
+            url, title = t["navs"].get(t["sel"]) or t["navs"][max(t["navs"])]
+            items.append({"url": url, "title": title, "pinned": t["pinned"]})
+        if items:
+            out.append({"tabs": items, "selected": min(w["sel"], len(items) - 1)})
+    return out
+
+
+class MpvHandler(Handler):
+    key = "mpv"
+    classes = ("mpv",)
+
+    def capture(self, ctx: Ctx, client: dict, win: dict) -> None:
+        argv = win.get("proc", {}).get("cmdline", [])
+        cwd = win.get("proc", {}).get("cwd") or str(HOME)
+        files = argv[argv.index("--") + 1:] if "--" in argv else [a for a in argv[1:] if not a.startswith("-")]
+        files = [f if "://" in f else os.path.join(cwd, f) for f in files]
+        title = re.sub(r"\s+-\s+mpv$", "", client.get("title", ""))
+        idx = next((i for i, f in enumerate(files) if Path(f).name == title or f == title), 0)
+        app = {"handler": self.key, "playlist": files, "playlist_pos": idx}
+        ipc = next((a.split("=", 1)[1] for a in argv if a.startswith("--input-ipc-server=")), None)
+        if ipc:
+            for prop in ("time-pos", "pause", "volume", "playlist-pos"):
+                v = mpv_ipc(ipc, prop)
+                if v is not None:
+                    app[prop.replace("-", "_")] = v
+            if isinstance(app.get("playlist_pos"), int):
+                idx = app["playlist_pos"]
+        else:
+            app["position"] = "unknown (start mpv with --input-ipc-server to capture it)"
+        win["app"] = app
+
+    def launch(self, ctx: Ctx, win: dict) -> list[str] | None:
+        argv = list(win.get("proc", {}).get("cmdline") or ["mpv"])
+        app = win.get("app", {})
+        argv = [a for a in argv if not a.startswith(("--playlist-start=", "--start=", "--pause"))]
+        extra = [f"--playlist-start={app.get('playlist_pos', 0)}"]
+        if isinstance(app.get("time_pos"), (int, float)):
+            extra.append(f"--start={app['time_pos']:.2f}")
+        if app.get("pause") is True:
+            extra.append("--pause")
+        return argv[:1] + extra + argv[1:]
+
+
+def mpv_ipc(path: str, prop: str):
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(1)
+            s.connect(path)
+            s.sendall(json.dumps({"command": ["get_property", prop]}).encode() + b"\n")
+            for line in s.recv(65536).decode().splitlines():
+                msg = json.loads(line)
+                if "error" in msg:
+                    return msg.get("data") if msg["error"] == "success" else None
+    except (OSError, json.JSONDecodeError):
+        return None
+    return None
+
+
+class ObsHandler(Handler):
+    key = "obs"
+    classes = ("com.obsproject.studio", "obs")
+
+    def capture(self, ctx: Ctx, client: dict, win: dict) -> None:
+        base = XDG_CONFIG / "obs-studio"
+        app = {"handler": self.key}
+        for ini in ("user.ini", "global.ini"):
+            cp = configparser.ConfigParser(interpolation=None, strict=False)
+            cp.optionxform = str
+            try:
+                cp.read(base / ini, encoding="utf-8-sig")
+            except configparser.Error:
+                continue
+            if cp.has_section("Basic") and cp["Basic"].get("Profile"):
+                b = cp["Basic"]
+                app.update(profile=b.get("Profile"), collection=b.get("SceneCollection", ""))
+                scenes = base / "basic/scenes" / b.get("SceneCollectionFile", "")
+                try:
+                    app["scene"] = json.loads(scenes.read_text()).get("current_scene", "")
+                except (OSError, json.JSONDecodeError):
+                    pass
+                break
+        win["app"] = app
+
+    def same(self, spec: dict, client: dict, argv: list[str]) -> bool:
+        return True
+
+    def launch(self, ctx: Ctx, win: dict) -> list[str] | None:
+        app = win.get("app", {})
+        argv = ["obs"]
+        for k in ("profile", "collection", "scene"):
+            if app.get(k):
+                argv += [f"--{k}", app[k]]
+        return argv
+
+
+class FileManagerHandler(Handler):
+    key = "filemanager"
+    classes = ("thunar", "org.gnome.nautilus", "pcmanfm*", "nemo", "org.kde.dolphin", "caja")
+
+    def capture(self, ctx: Ctx, client: dict, win: dict) -> None:
+        title = client.get("title", "")
+        folder = re.split(r"\s+[-–—]\s+", title)[0].strip()
+        path = resolve_folder(folder)
+        win["app"] = {"handler": self.key, "folder_title": folder, **({"folder": path} if path else {})}
+
+    def same(self, spec: dict, client: dict, argv: list[str]) -> bool:
+        return client.get("title") == spec.get("title")
+
+    def launch(self, ctx: Ctx, win: dict) -> list[str] | None:
+        argv = generic_launch(ctx, win) or [win["class"].lower()]
+        folder = win.get("app", {}).get("folder")
+        return [argv[0]] + ([folder] if folder and os.path.isdir(folder) else [])
+
+
+def resolve_folder(name: str) -> str | None:
+    """Turn a file-manager title (folder basename or path) into a real directory."""
+    if not name:
+        return None
+    if name.startswith(("/", "~")):
+        p = os.path.expanduser(name)
+        return p if os.path.isdir(p) else None
+    if name in ("Home", HOME.name):
+        return str(HOME)
+    cands = []
+    xbel = XDG_DATA / "recently-used.xbel"
+    if xbel.is_file():
+        for href in re.findall(r'href="file://([^"]+)"', xbel.read_text(errors="replace")):
+            d = unquote(href)
+            for p in [d, *map(str, Path(d).parents)]:
+                if Path(p).name == name and os.path.isdir(p):
+                    cands.append(p)
+    if not cands:
+        frontier = [HOME]
+        for _ in range(4):
+            nxt = []
+            for d in frontier:
+                try:
+                    for e in os.scandir(d):
+                        if e.is_dir(follow_symlinks=False) and not e.name.startswith("."):
+                            if e.name == name:
+                                cands.append(e.path)
+                            nxt.append(Path(e.path))
+                except OSError:
+                    continue
+            if cands or len(nxt) > 20000:
+                break
+            frontier = nxt
+    cands = [c for c in cands if not is_secret_path(c)]
+    return min(cands, key=len) if cands else None
+
+
+class TextEditorHandler(Handler):
+    """GTK notepads: unsaved buffers come from AT-SPI (see capture_atspi)."""
+    key = "texteditor"
+    classes = ("org.xfce.mousepad", "mousepad", "org.gnome.texteditor", "gnome-text-editor", "gedit",
+               "org.gnome.gedit", "featherpad", "l3afpad", "leafpad", "xed", "pluma", "notepadqq",
+               "org.kde.kwrite", "kwrite")
+
+    def capture(self, ctx: Ctx, client: dict, win: dict) -> None:
+        files = win.get("proc", {}).get("open_files", [])
+        win["app"] = {"handler": self.key, "documents": [{"url": f} for f in files]}
+
+    def launch(self, ctx: Ctx, win: dict) -> list[str] | None:
+        argv = generic_launch(ctx, win) or [win["class"].lower()]
+        docs = [d["url"] for d in win.get("app", {}).get("documents", []) if os.path.isfile(d["url"])]
+        rec = sorted((ctx.dir / "unsaved" / win["id"]).glob("atspi-*.txt")) if ctx.dir else []
+        # Unsaved buffers come back as recovery files next to the snapshot.
+        return [argv[0], *docs, *map(str, rec)]
+
+
+HANDLERS: list[Handler] = [KateHandler(), ChromiumHandler(), TerminalHandler(), MpvHandler(),
+                           ObsHandler(), FileManagerHandler(), TextEditorHandler()]
+GENERIC = Handler()
+
+
+def handler_for(cls: str) -> Handler:
+    return next((h for h in HANDLERS if h.match(cls)), GENERIC)
+
+# ───────────────────────────── AT-SPI text ─────────────────────────────
+
+ATSPI_SCRIPT = r"""
+import json, sys
+import gi
+gi.require_version("Atspi", "2.0")
+from gi.repository import Atspi
+pids = set(map(int, sys.argv[1:]))
+out = {}
+desk = Atspi.get_desktop(0)
+ROLES = {Atspi.Role.TEXT, Atspi.Role.ENTRY, Atspi.Role.DOCUMENT_TEXT, Atspi.Role.PARAGRAPH,
+         Atspi.Role.PASSWORD_TEXT, Atspi.Role.TERMINAL}
+for i in range(desk.get_child_count()):
+    app = desk.get_child_at_index(i)
+    try:
+        pid = app.get_process_id()
+    except Exception:
+        continue
+    if pid not in pids:
+        continue
+    texts, stack, seen = [], [(app, 0)], 0
+    while stack and seen < 6000:
+        node, depth = stack.pop()
+        seen += 1
+        try:
+            role = node.get_role()
+            if role in ROLES and role != Atspi.Role.PASSWORD_TEXT:
+                st = node.get_state_set()
+                if st.contains(Atspi.StateType.EDITABLE) or role == Atspi.Role.TERMINAL:
+                    t = node.get_text_iface()
+                    if t is not None:
+                        n = Atspi.Text.get_character_count(t)
+                        if n:
+                            texts.append(Atspi.Text.get_text(t, 0, min(n, 5_000_000)))
+            if depth < 60:
+                for j in range(node.get_child_count()):
+                    stack.append((node.get_child_at_index(j), depth + 1))
+        except Exception:
+            continue
+    out[str(pid)] = texts
+print(json.dumps(out))
+"""
+
+
+def capture_atspi(pids: list[int], timeout: float = 15) -> dict[int, list[str]]:
+    if not pids:
+        return {}
+    try:
+        r = subprocess.run([sys.executable, "-I", "-c", ATSPI_SCRIPT, *map(str, pids)],
+                           capture_output=True, text=True, timeout=timeout)
+        return {int(k): v for k, v in json.loads(r.stdout or "{}").items()}
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+        return {}
+
+# ─────────────────────────────── capture ───────────────────────────────
+
+def excluded(cfg: dict, cls: str) -> bool:
+    c = cls.lower()
+    if cfg.get("only") and not any(fnmatch.fnmatch(c, p.lower()) for p in cfg["only"]):
+        return True
+    return any(fnmatch.fnmatch(c, p.lower()) for p in cfg.get("exclude", []))
+
+
+def slug(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:24] or "win"
+
+
+def capture_session(cfg: dict, wm: Hyprland, snapdir: Path | None, name: str, note: str = "",
+                    files: bool = True, shots: bool | None = None, flush: bool = True) -> dict:
+    """Collect the whole session. With files=False nothing is written (status/diff)."""
+    ctx = Ctx(cfg, wm, snapdir, name)
+    monitors = wm.j("monitors")
+    workspaces = wm.j("workspaces")
+    active_win = wm.j("activewindow") or {}
+    clients = sorted(wm.clients(), key=lambda c: (c["workspace"]["id"] < 0, c["workspace"]["id"],
+                                                  c["at"][1], c["at"][0]))
+    mon_by_id = {m["id"]: m for m in monitors}
+    if files:
+        snapdir.mkdir(parents=True, exist_ok=True)
+        os.chmod(snapdir, 0o700)
+        raw = ctx.sub("raw")
+        for what in ("clients", "monitors", "workspaces", "activeworkspace", "activewindow", "layers",
+                     "devices", "version", "workspacerules", "globalshortcuts"):
+            try:
+                (raw / f"{what}.json").write_text(json.dumps(wm.j(what), indent=1))
+            except (RuntimeError, subprocess.TimeoutExpired):
+                pass
+
+    windows = []
+    for n, c in enumerate(clients, 1):
+        cls = c.get("class") or c.get("initialClass") or "unknown"
+        if excluded(cfg, cls):
+            continue
+        mon = mon_by_id.get(c.get("monitor"), {})
+        pid = c.get("pid", -1)
+        win = {
+            "id": f"w{n:02d}-{slug(cls)}",
+            "class": cls,
+            "initial_class": c.get("initialClass", ""),
+            "title": c.get("title", ""),
+            "initial_title": c.get("initialTitle", ""),
+            "workspace": c["workspace"]["name"],
+            "workspace_id": c["workspace"]["id"],
+            "monitor": mon.get("name", ""),
+            "at": c["at"],
+            "size": c["size"],
+            "at_rel": [c["at"][0] - mon.get("x", 0), c["at"][1] - mon.get("y", 0)],
+            "floating": bool(c.get("floating")),
+            "fullscreen": int(c.get("fullscreen") or 0),
+            "fullscreen_client": int(c.get("fullscreenClient") or 0),
+            "pinned": bool(c.get("pinned")),
+            "xwayland": bool(c.get("xwayland")),
+            "focus_history": c.get("focusHistoryID", 0),
+            "grouped": len(c.get("grouped") or []) > 0,
+            "address": c["address"],
+        }
+        if c["address"] == active_win.get("address"):
+            win["focused"] = True
+        if pid > 0:
+            argv = proc_cmdline(pid)
+            cwd = proc_link(pid, "cwd")
+            proc = {"pid": pid, "cmdline": redact_argv(argv), "cwd": cwd or "", "exe": proc_link(pid, "exe") or ""}
+            if argv_mentions_secret(argv, cwd):
+                proc["cmdline"] = argv[:1]
+                proc["redacted"] = True
+            appimage = proc_env(pid, {"APPIMAGE"}).get("APPIMAGE")
+            if appimage:
+                proc["appimage"] = appimage
+            proc["open_files"] = proc_open_files(pid)
+            unit = proc_read(pid, "cgroup").decode(errors="replace").strip().rsplit("/", 1)[-1]
+            if unit.endswith((".scope", ".service")):
+                proc["unit"] = unit
+            win["proc"] = proc
+        h = handler_for(cls)
+        try:
+            if files or h.key not in ("kate", "chromium"):
+                h.capture(ctx, c, win)
+            else:
+                win["app"] = {"handler": h.key}
+        except Exception as e:  # noqa: BLE001 — one broken app must not lose the whole snapshot
+            ctx.notes.append(f"{cls}: capture failed: {e}")
+            win.setdefault("app", {"handler": h.key})
+        win.setdefault("app", {"handler": h.key})
+        if files:
+            argv = h.launch(ctx, win) if h is not GENERIC else None
+            win["restore"] = {"command": argv or generic_launch(ctx, win) or []}
+        windows.append(win)
+
+    if files and cfg.get("atspi", True):
+        pids = sorted({w["proc"]["pid"] for w in windows if w.get("proc") and w["app"]["handler"] != "kate"})
+        texts = capture_atspi(pids)
+        for w in windows:
+            t = texts.get(w.get("proc", {}).get("pid", -1))
+            if not t or w.get("proc", {}).get("redacted"):
+                continue
+            out = ctx.sub("unsaved", w["id"])
+            for i, s in enumerate(t, 1):
+                (out / f"atspi-{i:02d}.txt").write_text(s)
+            w["app"]["accessible_text"] = len(t)
+            texts[w["proc"]["pid"]] = []          # one copy per process, not per window
+
+    if files and shots is not False and cfg.get("screenshots", True) and shutil.which("grim"):
+        sd = ctx.sub("shots")
+        visible = {m.get("activeWorkspace", {}).get("id") for m in monitors} | \
+                  {m.get("specialWorkspace", {}).get("id") for m in monitors if m.get("specialWorkspace", {}).get("id")}
+        for m in monitors:
+            subprocess.run(["grim", "-o", m["name"], str(sd / f"monitor-{m['name']}.png")], capture_output=True)
+        for w in windows:
+            if w["workspace_id"] in visible and w["size"][0] > 1 and w["size"][1] > 1:
+                g = f"{w['at'][0]},{w['at'][1]} {w['size'][0]}x{w['size'][1]}"
+                subprocess.run(["grim", "-g", g, str(sd / f"{w['id']}.png")], capture_output=True)
+
+    session = {
+        "format": FORMAT,
+        "meta": {
+            "name": name,
+            "note": note,
+            "created": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "host": os.uname().nodename,
+            "kernel": os.uname().release,
+            "backend": wm.name,
+            "compositor": (wm.j("version") or {}).get("tag", ""),
+            "uwsm": uwsm_active(),
+            "tool": f"msh-session {VERSION}",
+        },
+        "state": session_state(cfg, wm, monitors, ctx if files else None),
+        "monitors": [{
+            "name": m["name"], "description": m.get("description", ""), "width": m["width"],
+            "height": m["height"], "refresh": round(m.get("refreshRate", 0), 3), "x": m["x"], "y": m["y"],
+            "scale": m.get("scale", 1), "transform": m.get("transform", 0),
+            "active_workspace": m.get("activeWorkspace", {}).get("name", ""),
+            "special_workspace": m.get("specialWorkspace", {}).get("name", ""),
+            "focused": bool(m.get("focused")), "disabled": bool(m.get("disabled")),
+        } for m in monitors],
+        "workspaces": [{
+            "id": w["id"], "name": w["name"], "monitor": w.get("monitor", ""), "windows": w.get("windows", 0),
+            "fullscreen": bool(w.get("hasfullscreen")), "layout": w.get("tiledLayout", ""),
+        } for w in sorted(workspaces, key=lambda w: w["id"])],
+        "windows": windows,
+    }
+    if ctx.notes:
+        session["meta"]["notes"] = ctx.notes
+    if files:
+        if cfg.get("hypr_config", True) and (XDG_CONFIG / "hypr").is_dir():
+            shutil.copytree(XDG_CONFIG / "hypr", snapdir / "config/hypr", dirs_exist_ok=True,
+                            ignore=small_text_only)
+        session["meta"]["unsaved_files"] = sum(1 for _ in (snapdir / "unsaved").rglob("*") if _.is_file()) \
+            if (snapdir / "unsaved").is_dir() else 0
+        (snapdir / "session.toml").write_text(
+            f"# msh-session snapshot — {name}\n# restore: msh-session restore {name}\n\n" + toml_dumps(session))
+        (snapdir / "session.json").write_text(json.dumps(session, indent=1, ensure_ascii=False))
+    return session
+
+
+def small_text_only(d: str, names: list[str]) -> list[str]:
+    """copytree filter: config text only — no logs, VCS, images or anything big."""
+    skip = []
+    for n in names:
+        p = os.path.join(d, n)
+        if n in (".git", "logs") or n.endswith(".log") or is_secret_path(p):
+            skip.append(n)
+        elif os.path.isfile(p) and os.path.getsize(p) > 512 * 1024:
+            skip.append(n)
+    return skip
+
+
+def uwsm_active() -> bool:
+    if not shutil.which("uwsm"):
+        return False
+    return subprocess.run(["uwsm", "check", "is-active"], capture_output=True).returncode == 0
+
+
+def session_state(cfg: dict, wm: Hyprland, monitors: list[dict], ctx: Ctx | None) -> dict:
+    st: dict = {}
+    try:
+        aw = wm.j("activeworkspace")
+        st["active_workspace"] = aw.get("name", "")
+        fm = next((m["name"] for m in monitors if m.get("focused")), "")
+        st["focused_monitor"] = fm
+    except RuntimeError:
+        pass
+    try:
+        kb = next((k for k in wm.j("devices").get("keyboards", []) if k.get("main")), None)
+        if kb:
+            st["keyboard"] = {"device": kb["name"], "layout": kb.get("layout", ""), "variant": kb.get("variant", ""),
+                              "keymap": kb.get("active_keymap", ""), "index": kb.get("active_layout_index", 0)}
+    except (RuntimeError, AttributeError):
+        pass
+    wp = wm.raw("hyprpaper", "listactive").strip()
+    if wp and "=" not in wp[:3] and ":" in wp:
+        st["wallpaper"] = {k.strip(): v.strip() for k, v in
+                           (l.split(":", 1) for l in wp.splitlines() if ":" in l) if os.path.isfile(v.strip())}
+    if shutil.which("wpctl"):
+        r = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"], capture_output=True, text=True)
+        m = re.search(r"Volume:\s*([\d.]+)", r.stdout)
+        if m:
+            st["audio"] = {"volume": float(m.group(1)), "muted": "MUTED" in r.stdout}
+    env = {}
+    try:
+        r = subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            k, _, v = line.partition("=")
+            if ENV_ALLOW.match(k) and not ENV_DENY.search(k):
+                env[k] = v
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    if env:
+        st["env"] = env
+    try:
+        r = subprocess.run(["systemctl", "--user", "list-units", "--type=scope,service", "--state=running",
+                            "--no-legend", "--plain", "app-*"], capture_output=True, text=True, timeout=5)
+        st["uwsm_units"] = [l.split()[0] for l in r.stdout.splitlines() if l.strip()]
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    if ctx and cfg.get("clipboard") and shutil.which("wl-paste"):
+        types = subprocess.run(["wl-paste", "--list-types"], capture_output=True, text=True).stdout.split()
+        t = next((t for t in types if t.startswith("text/plain")), None) or next(
+            (t for t in types if t.startswith("image/")), None)
+        if t:
+            data = subprocess.run(["wl-paste", "--no-newline", "--type", t], capture_output=True).stdout
+            (ctx.sub("clipboard") / "content").write_bytes(data)
+            st["clipboard"] = {"type": t, "file": "clipboard/content"}
+    return st
+
+# ─────────────────────────────── restore ───────────────────────────────
+
+def match_windows(specs: list[dict], live: list[dict]) -> list[tuple[dict, dict]]:
+    """Pair snapshot windows with live ones of the same program (greedy by score)."""
+    pairs = []
+    for s in specs:
+        for c in live:
+            cls = (c.get("class") or "").lower()
+            if cls != s["class"].lower() and (c.get("initialClass") or "").lower() != s.get("initial_class", "").lower():
+                continue
+            argv = redact_argv(proc_cmdline(c["pid"])) if c.get("pid", -1) > 0 else []
+            if not handler_for(s["class"]).same(s, c, argv):
+                continue
+            score = 1
+            if c.get("title") == s.get("title"):
+                score += 4
+            if c.get("initialTitle") == s.get("initial_title"):
+                score += 1
+            if argv and argv == s.get("proc", {}).get("cmdline"):
+                score += 2
+            if c.get("workspace", {}).get("name") == s.get("workspace"):
+                score += 1
+            pairs.append((score, s["id"], c["address"], s, c))
+    pairs.sort(key=lambda p: -p[0])
+    used_s, used_c, out = set(), set(), []
+    for _, sid, addr, s, c in pairs:
+        if sid in used_s or addr in used_c:
+            continue
+        used_s.add(sid)
+        used_c.add(addr)
+        out.append((s, c))
+    return out
+
+
+def launch_env(cfg: dict, argv: list[str]) -> list[str]:
+    mode = cfg.get("uwsm", "auto")
+    if mode == "never" or not shutil.which("uwsm"):
+        return argv
+    if mode == "auto" and not uwsm_active():
+        return argv
+    return ["uwsm", "app", "--", *argv]
+
+
+def place_windows(wm: Hyprland, placements: list[tuple[dict, str]]) -> None:
+    live = {c["address"]: c for c in wm.clients()}
+    cmds = []
+    for s, addr in placements:
+        c = live.get(addr)
+        if not c:
+            continue
+        a = f"address:{addr}"
+        if c.get("pinned") and not s.get("pinned"):
+            cmds.append(f"dispatch pin {a}")
+        if c["workspace"]["name"] != s["workspace"]:
+            cmds.append(f"dispatch movetoworkspacesilent {s['workspace']},{a}")
+        if s.get("floating") and not c.get("floating"):
+            cmds.append(f"dispatch setfloating {a}")
+        elif not s.get("floating") and c.get("floating"):
+            cmds.append(f"dispatch settiled {a}")
+        if s.get("floating"):
+            cmds.append(f"dispatch resizewindowpixel exact {s['size'][0]} {s['size'][1]},{a}")
+    wm.batch(cmds)
+    # `movewindowpixel exact` is monitor-relative only on visible workspaces, so
+    # positions are corrected with relative moves by the measured delta.
+    for _ in range(3):
+        live = {c["address"]: c for c in wm.clients()}
+        fix = []
+        for s, addr in placements:
+            c = live.get(addr)
+            if c and s.get("floating"):
+                dx, dy = s["at"][0] - c["at"][0], s["at"][1] - c["at"][1]
+                if dx or dy:
+                    fix.append(f"dispatch movewindowpixel {dx} {dy},address:{addr}")
+        if not fix:
+            break
+        wm.batch(fix)
+        time.sleep(0.05)
+    pins = [f"dispatch pin address:{addr}" for s, addr in placements
+            if s.get("pinned") and not live.get(addr, {}).get("pinned")]
+    wm.batch(pins)
+    for s, addr in placements:
+        if s.get("fullscreen"):
+            wm.batch([f"dispatch focuswindow address:{addr}",
+                      f"dispatch fullscreenstate {s['fullscreen']} {s.get('fullscreen_client', s['fullscreen'])}"])
+
+
+def restore_state(cfg: dict, wm: Hyprland, sess: dict, snapdir: Path, focus_addr: str | None) -> None:
+    st = sess.get("state", {})
+    cmds = []
+    live_mons = {m["name"] for m in wm.j("monitors")}
+    for m in sess.get("monitors", []):
+        if m["name"] in live_mons and m.get("active_workspace") and not m["active_workspace"].startswith("special"):
+            cmds += [f"dispatch focusmonitor {m['name']}", f"dispatch workspace {m['active_workspace']}"]
+    if st.get("focused_monitor") in live_mons:
+        cmds.append(f"dispatch focusmonitor {st['focused_monitor']}")
+    if focus_addr:
+        cmds.append(f"dispatch focuswindow address:{focus_addr}")
+    wm.batch(cmds)
+    kb = st.get("keyboard")
+    if kb:
+        wm.raw("switchxkblayout", kb["device"], str(kb.get("index", 0)))
+    for mon, path in (st.get("wallpaper") or {}).items():
+        if os.path.isfile(path) and mon in live_mons:
+            wm.raw("hyprpaper", "preload", path)
+            wm.raw("hyprpaper", "wallpaper", f"{mon},{path}")
+    au = st.get("audio")
+    if au and shutil.which("wpctl"):
+        subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", str(au["volume"])], capture_output=True)
+        subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "1" if au.get("muted") else "0"],
+                       capture_output=True)
+    clip = st.get("clipboard")
+    if clip and cfg.get("clipboard") and shutil.which("wl-copy") and (snapdir / clip["file"]).is_file():
+        with open(snapdir / clip["file"], "rb") as f:
+            subprocess.Popen(["wl-copy", "--type", clip["type"]], stdin=f, start_new_session=True)
+
+
+def do_restore(cfg: dict, store: Store, wm: Hyprland, name: str, *, close_others: bool, dry: bool,
+               yes: bool, place: bool, as_json: bool, auto_snapshot: bool = True, tag: str = "pre-restore",
+               state: bool = True) -> int:
+    sess = store.load(name)
+    snapdir = store.path(name)
+    specs = [w for w in sess.get("windows", []) if not excluded(cfg, w["class"])]
+    live = [c for c in wm.clients() if not excluded(cfg, c.get("class") or "")]
+    pairs = match_windows(specs, live)
+    reused = {s["id"]: c for s, c in pairs}
+    to_launch = [s for s in specs if s["id"] not in reused]
+    matched_addr = {c["address"] for c in reused.values()}
+    to_close = [c for c in live if c["address"] not in matched_addr] if close_others else []
+
+    plan = {"session": name, "reuse": [[s["id"], c["address"]] for s, c in pairs],
+            "launch": [{"id": s["id"], "command": (s.get("restore") or {}).get("command", [])} for s in to_launch],
+            "close": [{"address": c["address"], "class": c.get("class"), "title": c.get("title")} for c in to_close]}
+    if as_json and dry:
+        print(json.dumps(plan, indent=2, ensure_ascii=False))
+        return 0
+    rows = [[Out.c("32", "reuse"), s["workspace"], s["class"], trunc(s["title"], 50)] for s, _ in pairs]
+    rows += [[Out.c("1;34", "launch"), s["workspace"], s["class"], trunc(s["title"], 50)] for s in to_launch]
+    rows += [[Out.c("1;31", "close"), c["workspace"]["name"], c.get("class", ""), trunc(c.get("title", ""), 50)]
+             for c in to_close]
+    if not as_json:
+        Out.info(f"restore plan for {Out.c('1;35', name)}")
+        table(rows, ["ACTION", "WS", "CLASS", "TITLE"])
+    if dry:
+        return 0
+    if to_close and not confirm(f"close {len(to_close)} window(s) not in '{name}'?", yes):
+        return 1
+    if auto_snapshot:
+        auto = f"auto-{tag}-{datetime.now():%Y%m%d-%H%M%S}"
+        capture_session(cfg, wm, store.path(auto), auto, note=f"automatic, before {tag.split('-', 1)[1]} '{name}'",
+                        shots=False)
+        prune_auto(store, cfg.get("keep_auto", 10))
+        Out.ok(f"current session saved as {auto}")
+
+    ctx = Ctx(cfg, wm, snapdir, name)
+    ctx.restoring = True
+    # 1. close what does not belong (gracefully — apps may ask to save)
+    for c in to_close:
+        wm.dispatch("closewindow", f"address:{c['address']}")
+    if to_close:
+        deadline = time.time() + float(cfg.get("close_timeout", 10))
+        left = {c["address"] for c in to_close}
+        while left and time.time() < deadline:
+            time.sleep(0.15)
+            left &= {c["address"] for c in wm.clients()}
+        if left:
+            Out.warn(f"{len(left)} window(s) did not close (waiting for a save dialog?)")
+
+    # 2. let apps load their state into reused windows (Kate session switch)
+    for s, c in pairs:
+        try:
+            handler_for(s["class"]).prepare(ctx, s, c)
+        except Exception as e:  # noqa: BLE001
+            Out.warn(f"{s['class']}: {e}")
+
+    # 3. launch what is missing, all at once
+    before = {c["address"] for c in wm.clients()}
+    pending: list[dict] = []
+    groups: dict[str, list[dict]] = {}
+    for s in to_launch:
+        h = handler_for(s["class"])
+        g = h.launch_group(s)
+        if g:
+            groups.setdefault(g, []).append(s)
+            if len(groups[g]) > 1:
+                pending.append(s)
+                continue
+        try:
+            argv = h.launch(ctx, s) if h is not GENERIC else None
+        except Exception as e:  # noqa: BLE001
+            Out.warn(f"{s['class']}: {e}")
+            argv = None
+        argv = argv or (s.get("restore") or {}).get("command") or generic_launch(ctx, s)
+        if not argv:
+            Out.warn(f"don't know how to start {s['class']} — set [launch] {s['class']!r} in {CONFIG_FILE}")
+            continue
+        wm.exec(launch_env(cfg, argv))
+        pending.append(s)
+
+    # 4. pick up new windows as they map and assign them to snapshot windows
+    placements = [(s, c["address"]) for s, c in pairs]
+    deadline = time.time() + float(cfg.get("launch_timeout", 20))
+    taken = set(before)
+    while pending and time.time() < deadline:
+        time.sleep(0.12)
+        new = [c for c in wm.clients() if c["address"] not in taken]
+        for c in new:
+            cands = [s for s in pending if s["class"].lower() == (c.get("class") or "").lower()
+                     or s.get("initial_class", "").lower() == (c.get("initialClass") or "").lower()]
+            if not cands:
+                continue
+            best = max(cands, key=lambda s: (s["title"] == c.get("title"), -pending.index(s)))
+            pending.remove(best)
+            taken.add(c["address"])
+            placements.append((best, c["address"]))
+    if pending:
+        Out.warn("not started in time: " + ", ".join(s["class"] for s in pending))
+
+    # 5. put every window back in place, then the session-wide state
+    if place:
+        place_windows(wm, placements)
+    focus = next((addr for s, addr in placements if s.get("focused")), None)
+    if state and not cfg.get("only"):
+        restore_state(cfg, wm, sess, snapdir, focus if place else None)
+    elif focus and place:
+        wm.dispatch("focuswindow", f"address:{focus}")
+    for s, addr in placements:
+        try:
+            handler_for(s["class"]).after(ctx, s, {"address": addr})
+        except Exception:  # noqa: BLE001
+            pass
+    store.set_active(name)
+    unsaved = sess.get("meta", {}).get("unsaved_files", 0)
+    if as_json:
+        print(json.dumps({**plan, "placed": len(placements), "missing": [s["id"] for s in pending]}, indent=2))
+    else:
+        Out.ok(f"restored {Out.c('1;35', name)}: {len(pairs)} reused, {len(placements) - len(pairs)} launched"
+               + (f", {len(pending)} missing" if pending else ""))
+        if unsaved:
+            Out.info(f"unsaved data copies: {snapdir / 'unsaved'}")
+    return 0 if not pending else 2
+
+
+def trunc(s: str, n: int) -> str:
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def prune_auto(store: Store, keep: int) -> list[str]:
+    autos = [n for n in store.names() if n.startswith("auto-")]
+    gone = []
+    for n in autos[keep:]:
+        shutil.rmtree(store.path(n), ignore_errors=True)
+        gone.append(n)
+    return gone
+
+# ─────────────────────────────── commands ──────────────────────────────
+
+def need_wm() -> Hyprland:
+    if not Hyprland.available():
+        die("no supported compositor session found (Hyprland: HYPRLAND_INSTANCE_SIGNATURE + hyprctl)")
+    return Hyprland()
+
+
+def cmd_save(a, cfg, store):
+    wm = need_wm()
+    name = a.name or datetime.now().strftime("%Y%m%d-%H%M%S")
+    if not NAME_RE.match(name):
+        die(f"invalid name '{name}' (letters, digits, . _ -)")
+    store.ensure()
+    path = store.path(name)
+    if path.exists():
+        if not (a.force or confirm(f"'{name}' exists — replace it?", a.yes)):
+            return 1
+        trash = store.root / ".trash" / f"{name}-{datetime.now():%Y%m%d-%H%M%S}"
+        trash.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(path, trash)
+    t0 = time.time()
+    sess = capture_session(cfg, wm, path, name, note=a.message or "", shots=not a.no_shots)
+    store.set_active(name)
+    if a.json:
+        print(json.dumps({"name": name, "path": str(path), "windows": len(sess["windows"]),
+                          "unsaved_files": sess["meta"].get("unsaved_files", 0)}))
+        return 0
+    Out.ok(f"saved {Out.c('1;35', name)} — {len(sess['windows'])} windows, "
+           f"{sess['meta'].get('unsaved_files', 0)} unsaved-data files, {time.time() - t0:.1f}s")
+    for n in sess["meta"].get("notes", []):
+        Out.warn(n)
+    print(path)
+    return 0
+
+
+def snapshot_row(store: Store, n: str, active: str | None) -> dict:
+    d = store.path(n)
+    try:
+        s = json.loads((d / "session.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        s = tomllib.loads((d / "session.toml").read_text())
+    m = s.get("meta", {})
+    return {"name": n, "created": m.get("created", ""), "windows": len(s.get("windows", [])),
+            "unsaved": m.get("unsaved_files", 0), "size": dir_size(d), "note": m.get("note", ""),
+            "active": n == active, "auto": n.startswith("auto-"), "path": str(d)}
+
+
+def cmd_list(a, cfg, store):
+    names = store.names(include_auto=a.all)
+    if a.names:
+        print("\n".join(names))
+        return 0
+    active = store.active()
+    rows = [snapshot_row(store, n, active) for n in names]
+    if a.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        Out.info(f"no session snapshots in {store.root} — create one: msh-session save <name>")
+        return 0
+    table([[Out.c("1;35", f"#{i}"), (Out.c("1;32", "● ") if r["active"] else "  ") + Out.c("1", r["name"]),
+            r["created"].replace("T", " ")[:19], str(r["windows"]),
+            Out.c("33", str(r["unsaved"])) if r["unsaved"] else "0", human_size(r["size"]), trunc(r["note"], 40)]
+           for i, r in enumerate(rows, 1)], ["#", "  NAME", "CREATED", "WIN", "UNSAVED", "SIZE", "NOTE"])
+    return 0
+
+
+def cmd_show(a, cfg, store):
+    name = store.resolve(a.name)
+    sess = store.load(name)
+    if a.json:
+        print(json.dumps(sess, indent=2, ensure_ascii=False))
+        return 0
+    m = sess["meta"]
+    print(f"{Out.c('1;35', name)}  {m.get('created', '')}  {Out.c('2', m.get('compositor', ''))}"
+          + (f"\n{Out.c('3', m['note'])}" if m.get("note") else ""))
+    for mon in sess.get("monitors", []):
+        print(f"  {Out.c('1;36', mon['name'])} {mon['width']}x{mon['height']}@{mon['x']},{mon['y']} "
+              f"ws={mon['active_workspace']}")
+    rows = []
+    for w in sess.get("windows", []):
+        app = w.get("app", {})
+        detail = ""
+        if app.get("handler") == "kate":
+            detail = f"{len(app.get('documents', []))} docs, {app.get('unsaved', 0)} unsaved"
+        elif app.get("handler") == "chromium":
+            detail = f"{len(app.get('tabs', []))} tabs"
+        elif app.get("handler") == "terminal":
+            detail = "; ".join((t.get("cwd", "") + (" $ " + shlex.join(t["command"]) if t.get("command") else ""))
+                               for t in app.get("tabs", []))
+        elif app.get("handler") == "mpv":
+            detail = f"{len(app.get('playlist', []))} files, #{app.get('playlist_pos', 0) + 1}"
+        elif app.get("handler") == "obs":
+            detail = f"{app.get('profile', '')}/{app.get('collection', '')}"
+        elif app.get("handler") == "filemanager":
+            detail = app.get("folder", app.get("folder_title", ""))
+        if app.get("accessible_text"):
+            detail += f" +{app['accessible_text']} text"
+        flags = "".join(f for f, on in (("F", w.get("floating")), ("P", w.get("pinned")),
+                                        ("⛶", w.get("fullscreen")), ("*", w.get("focused"))) if on)
+        rows.append([w["workspace"], Out.c("1", w["class"]), trunc(w["title"], 40),
+                     f"{w['size'][0]}x{w['size'][1]}+{w['at'][0]}+{w['at'][1]}", flags, trunc(detail, 50)])
+    table(rows, ["WS", "CLASS", "TITLE", "GEOMETRY", "ST", "STATE"])
+    if not a.no_files:
+        un = store.path(name) / "unsaved"
+        if un.is_dir():
+            files = sorted(f for f in un.rglob("*") if f.is_file())
+            if files:
+                print(Out.c("1;33", f"\nunsaved data ({len(files)}):"))
+                for f in files:
+                    print(f"  {f.relative_to(store.path(name))}  {Out.c('2', human_size(f.stat().st_size))}")
+    return 0
+
+
+def cmd_restore(a, cfg, store):
+    wm = need_wm()
+    name = store.resolve(a.name)
+    return do_restore(cfg, store, wm, name, close_others=a.close_others, dry=a.dry_run, yes=a.yes,
+                      place=not a.no_place, as_json=a.json, auto_snapshot=not a.no_backup, state=not a.no_state)
+
+
+def cmd_switch(a, cfg, store):
+    wm = need_wm()
+    name = store.resolve(a.name)
+    active = store.active()
+    if a.update and active and active != name and not a.dry_run and not active.startswith("auto-"):
+        capture_session(cfg, wm, store.path(active).with_name(active + ".tmp"), active, shots=False)
+        shutil.rmtree(store.path(active), ignore_errors=True)
+        store.path(active + ".tmp").rename(store.path(active))
+        Out.ok(f"updated {active}")
+    return do_restore(cfg, store, wm, name, close_others=not a.keep, dry=a.dry_run, yes=a.yes, place=True,
+                      as_json=a.json, auto_snapshot=not a.no_backup, tag="pre-switch", state=not a.no_state)
+
+
+def window_key(w: dict) -> str:
+    return f"{w['class']}|{w.get('workspace', '')}|{w.get('title', '')}"
+
+
+def cmd_diff(a, cfg, store):
+    left_name = store.resolve(a.a)
+    left = store.load(left_name)
+    if a.b:
+        right_name, right = a.b, store.load(store.resolve(a.b))
+    else:
+        right_name, right = "live", capture_session(cfg, need_wm(), None, "live", files=False)
+    lk = {window_key(w): w for w in left["windows"]}
+    rk = {window_key(w): w for w in right["windows"]}
+    removed = [lk[k] for k in lk if k not in rk]
+    added = [rk[k] for k in rk if k not in lk]
+    moved = []
+    for k in lk.keys() & rk.keys():
+        l, r = lk[k], rk[k]
+        if l["at"] != r["at"] or l["size"] != r["size"] or l.get("floating") != r.get("floating"):
+            moved.append((l, r))
+    if a.json:
+        print(json.dumps({"from": left_name, "to": right_name, "added": [window_key(w) for w in added],
+                          "removed": [window_key(w) for w in removed],
+                          "moved": [window_key(l) for l, _ in moved]}, indent=2, ensure_ascii=False))
+        return 0
+    print(f"{Out.c('1;35', left_name)} → {Out.c('1;35', right_name)}")
+    for w in removed:
+        print(Out.c("31", f"  - [{w['workspace']}] {w['class']}: {trunc(w['title'], 70)}"))
+    for w in added:
+        print(Out.c("32", f"  + [{w['workspace']}] {w['class']}: {trunc(w['title'], 70)}"))
+    for l, r in moved:
+        print(Out.c("33", f"  ~ [{l['workspace']}] {l['class']}: {l['size'][0]}x{l['size'][1]}+{l['at'][0]}+{l['at'][1]}"
+                          f" → {r['size'][0]}x{r['size'][1]}+{r['at'][0]}+{r['at'][1]}"))
+    if not (removed or added or moved):
+        print("  (no window differences)")
+    return 0
+
+
+def cmd_status(a, cfg, store):
+    wm = need_wm()
+    sess = capture_session(cfg, wm, None, "live", files=False)
+    if a.json:
+        print(json.dumps(sess, indent=2, ensure_ascii=False))
+        return 0
+    rows = []
+    for w in sess["windows"]:
+        h = w.get("app", {}).get("handler", "generic")
+        rows.append([w["workspace"], w.get("monitor", ""), Out.c("1", w["class"]), trunc(w["title"], 46),
+                     f"{w['size'][0]}x{w['size'][1]}+{w['at'][0]}+{w['at'][1]}",
+                     "float" if w["floating"] else "tiled", Out.c("36", h)])
+    print(f"active snapshot: {Out.c('1;35', store.active() or '—')}   uwsm: {sess['meta']['uwsm']}   "
+          f"{sess['meta']['compositor']}")
+    table(rows, ["WS", "MON", "CLASS", "TITLE", "GEOMETRY", "MODE", "HANDLER"])
+    return 0
+
+
+def cmd_rm(a, cfg, store):
+    names = [store.resolve(n) for n in a.names] if a.names else [store.resolve(None)]
+    if not confirm(f"delete {', '.join(names)}?", a.yes):
+        return 1
+    for n in names:
+        shutil.rmtree(store.path(n))
+        if store.active() == n:
+            (store.root / ".active").unlink(missing_ok=True)
+        Out.ok(f"removed {n}")
+    return 0
+
+
+def cmd_prune(a, cfg, store):
+    autos = [n for n in store.names() if n.startswith("auto-")][a.keep:]
+    if not autos:
+        Out.info("nothing to prune")
+        return 0
+    if not confirm(f"delete {len(autos)} automatic snapshot(s)?", a.yes):
+        return 1
+    prune_auto(store, a.keep)
+    shutil.rmtree(store.root / ".trash", ignore_errors=True)
+    Out.ok(f"pruned {len(autos)}")
+    return 0
+
+
+def cmd_rename(a, cfg, store):
+    old = store.resolve(a.old)
+    if not NAME_RE.match(a.new) or store.path(a.new).exists():
+        die(f"invalid or existing name: {a.new}")
+    store.path(old).rename(store.path(a.new))
+    if store.active() == old:
+        store.set_active(a.new)
+    Out.ok(f"{old} → {a.new}")
+    return 0
+
+
+def cmd_path(a, cfg, store):
+    print(store.path(store.resolve(a.name)) if a.name else store.root)
+    return 0
+
+
+def cmd_export(a, cfg, store):
+    name = store.resolve(a.name)
+    out = Path(a.output or f"{name}.msh-session.tar.gz")
+    with tarfile.open(out, "w:gz") as t:
+        t.add(store.path(name), arcname=name)
+    os.chmod(out, 0o600)
+    Out.ok(f"exported {name} → {out}")
+    return 0
+
+
+def cmd_import(a, cfg, store):
+    store.ensure()
+    with tarfile.open(a.file) as t:
+        tops = {m.name.split("/")[0] for m in t.getmembers()}
+        if len(tops) != 1 or not NAME_RE.match(next(iter(tops))):
+            die("not a msh-session export")
+        name = a.name or next(iter(tops))
+        if store.path(name).exists():
+            die(f"'{name}' already exists")
+        tmp = store.root / f".import-{os.getpid()}"
+        t.extractall(tmp, filter="data")
+        (tmp / next(iter(tops))).rename(store.path(name))
+        shutil.rmtree(tmp, ignore_errors=True)
+    Out.ok(f"imported {name}")
+    return 0
+
+
+def cmd_doctor(a, cfg, store):
+    checks = []
+
+    def chk(name, ok, hint=""):
+        checks.append({"check": name, "ok": bool(ok), "hint": "" if ok else hint})
+
+    chk("hyprland session", Hyprland.available(), "run inside Hyprland")
+    chk("uwsm", uwsm_active(), "not under UWSM — windows are started with hyprctl exec")
+    chk("grim (screenshots)", shutil.which("grim"), "pacman -S grim")
+    chk("qdbus6 (Kate unsaved docs)", KateHandler.qdbus(), "pacman -S qt6-tools")
+    try:
+        import gi  # noqa: F401
+        gi_ok = True
+    except ImportError:
+        gi_ok = False
+    chk("python-gobject (AT-SPI text)", gi_ok, "pacman -S python-gobject at-spi2-core")
+    a11y = os.environ.get("QT_LINUX_ACCESSIBILITY_ALWAYS_ON") == "1"
+    chk("Qt accessibility on", a11y, "msh-session a11y on  (Qt apps then expose unsaved text)")
+    krc = False
+    kconf = XDG_CONFIG / "kitty/kitty.conf"
+    if kconf.is_file():
+        txt = kconf.read_text(errors="replace")
+        krc = re.search(r"^\s*allow_remote_control\s+(yes|socket|socket-only)", txt, re.M) and \
+            re.search(r"^\s*listen_on\s+\S", txt, re.M)
+    chk("kitty remote control (scrollback)", krc,
+        "add to kitty.conf: allow_remote_control socket-only + listen_on unix:@kitty-{kitty_pid}")
+    mconf = XDG_CONFIG / "mpv/mpv.conf"
+    chk("mpv IPC (playback position)", mconf.is_file() and "input-ipc-server" in mconf.read_text(errors="replace"),
+        "add to mpv.conf: input-ipc-server=/tmp/mpv-socket-${pid}… (one socket per player)")
+    kate = configparser.ConfigParser(interpolation=None, strict=False)
+    kate.optionxform = str
+    try:
+        kate.read(XDG_CONFIG / "katerc")
+        stash = any(kate.has_option(s, "Stash new unsaved files") and kate[s]["Stash new unsaved files"] == "true"
+                    for s in kate.sections())
+    except configparser.Error:
+        stash = False
+    chk("Kate stash of unsaved files", stash, "Kate → Settings → Behavior → Stash new unsaved files")
+    if a.json:
+        print(json.dumps(checks, indent=2))
+        return 0
+    for c in checks:
+        mark = Out.c("1;32", "✓") if c["ok"] else Out.c("1;33", "!")
+        print(f" {mark} {c['check']}" + (f"  {Out.c('2', '→ ' + c['hint'])}" if c["hint"] else ""))
+    print(f"\n store: {store.root}\n config: {CONFIG_FILE}{'' if CONFIG_FILE.is_file() else ' (defaults)'}")
+    return 0
+
+
+A11Y_MARK = "# msh-session: accessibility (unsaved text capture)"
+A11Y_LINES = ["export QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1", "export ACCESSIBILITY_ENABLED=1"]
+
+
+def cmd_a11y(a, cfg, store):
+    envf = XDG_CONFIG / "uwsm/env"
+    text = envf.read_text() if envf.is_file() else ""
+    on = A11Y_MARK in text
+    if a.action == "status":
+        print("on" if on else "off", f"({envf})")
+        return 0
+    if a.action == "on":
+        if on:
+            Out.info("already on")
+            return 0
+        envf.parent.mkdir(parents=True, exist_ok=True)
+        envf.write_text(text + ("" if text.endswith("\n") or not text else "\n") + A11Y_MARK + "\n"
+                        + "\n".join(A11Y_LINES) + "\n")
+        Out.ok(f"enabled in {envf} — takes effect for apps started after the next login")
+    else:
+        lines = [l for l in text.splitlines() if l != A11Y_MARK and l not in A11Y_LINES]
+        envf.write_text("\n".join(lines) + ("\n" if lines else ""))
+        Out.ok(f"disabled in {envf}")
+    return 0
+
+
+def cmd_config(a, cfg, store):
+    if a.action == "path":
+        print(CONFIG_FILE)
+    elif a.action == "init":
+        if CONFIG_FILE.exists():
+            die(f"{CONFIG_FILE} exists")
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(CONFIG_TEMPLATE)
+        Out.ok(f"wrote {CONFIG_FILE}")
+    else:
+        shown = {k: (str(v) if isinstance(v, Path) else v) for k, v in cfg.items()}
+        print(json.dumps(shown, indent=2) if a.json else toml_dumps(shown), end="" if not a.json else "\n")
+    return 0
+
+# ───────────────────────────── completions ─────────────────────────────
+
+COMMANDS = {
+    "save": "snapshot the running session (windows, apps, unsaved data)",
+    "restore": "bring a snapshot back (reuse open windows, launch the rest)",
+    "switch": "close everything not in a snapshot, then restore it",
+    "list": "list snapshots (newest first)",
+    "show": "windows, apps and unsaved data inside a snapshot",
+    "status": "what would be saved right now",
+    "diff": "compare a snapshot with another one or the live session",
+    "rm": "delete snapshots",
+    "prune": "delete old automatic snapshots",
+    "rename": "rename a snapshot",
+    "path": "print the store or a snapshot directory",
+    "export": "pack a snapshot into a .tar.gz",
+    "import": "unpack an exported snapshot",
+    "doctor": "check what can be captured on this system",
+    "a11y": "turn accessibility on/off for Qt/Electron apps (unsaved text)",
+    "config": "show, init or locate the config file",
+    "completion": "print shell completion (zsh, bash, fish)",
+}
+NAME_CMDS = ("restore", "switch", "show", "diff", "rm", "rename", "path", "export")
+
+
+def completion(shell: str) -> str:
+    cmds = " ".join(COMMANDS)
+    named = " ".join(NAME_CMDS)
+    if shell == "bash":
+        return f"""# bash completion for msh-session
+_msh_session() {{
+  local cur=${{COMP_WORDS[COMP_CWORD]}} cmd=${{COMP_WORDS[1]}}
+  if (( COMP_CWORD == 1 )); then COMPREPLY=($(compgen -W "{cmds} --help --version --no-color" -- "$cur")); return; fi
+  case " {named} " in *" $cmd "*)
+    [[ $cur != -* ]] && {{ COMPREPLY=($(compgen -W "$(msh-session list --all --names 2>/dev/null)" -- "$cur")); return; }};;
+  esac
+  case $cmd in
+    a11y) COMPREPLY=($(compgen -W "on off status" -- "$cur"));;
+    config) COMPREPLY=($(compgen -W "show init path" -- "$cur"));;
+    completion) COMPREPLY=($(compgen -W "zsh bash fish" -- "$cur"));;
+    import) COMPREPLY=($(compgen -f -- "$cur"));;
+    *) COMPREPLY=($(compgen -W "--json --yes --dry-run --help" -- "$cur"));;
+  esac
+}}
+complete -F _msh_session msh-session
+"""
+    if shell == "fish":
+        lines = ["# fish completion for msh-session", "complete -c msh-session -f"]
+        for c, d in COMMANDS.items():
+            lines.append(f"complete -c msh-session -n __fish_use_subcommand -a {c} -d {shlex.quote(d)}")
+        lines.append(f"complete -c msh-session -n '__fish_seen_subcommand_from {named}' "
+                     "-a '(msh-session list --all --names 2>/dev/null)'")
+        lines.append("complete -c msh-session -n '__fish_seen_subcommand_from a11y' -a 'on off status'")
+        lines.append("complete -c msh-session -n '__fish_seen_subcommand_from config' -a 'show init path'")
+        lines.append("complete -c msh-session -n '__fish_seen_subcommand_from completion' -a 'zsh bash fish'")
+        for o, d in (("json", "machine-readable output"), ("yes", "do not ask"), ("dry-run", "only show the plan"),
+                     ("no-color", "plain output"), ("help", "help")):
+            lines.append(f"complete -c msh-session -l {o} -d {shlex.quote(d)}")
+        return "\n".join(lines) + "\n"
+    descs = "\n".join(f"    '{c}:{d}'" for c, d in COMMANDS.items())
+    return f"""#compdef msh-session
+# zsh completion for msh-session
+_msh_session_names() {{
+  local -a n; n=(${{(f)"$(msh-session list --all --names 2>/dev/null)"}}); _describe 'snapshot' n
+}}
+_msh-session() {{
+  local -a cmds; cmds=(
+{descs}
+  )
+  if (( CURRENT == 2 )); then _describe 'command' cmds; return; fi
+  case $words[2] in
+    {'|'.join(NAME_CMDS)}) _arguments '*:snapshot:_msh_session_names' '--json[JSON output]' \\
+        '(-y --yes)'{{-y,--yes}}'[do not ask]' '(-n --dry-run)'{{-n,--dry-run}}'[only show the plan]' \\
+        '--keep[keep windows not in the snapshot]' '--close-others[close windows not in the snapshot]' \\
+        '--no-place[do not move windows]' '--no-backup[no automatic snapshot first]' \\
+        '(-u --update)'{{-u,--update}}'[save the active session first]' '--no-files[hide unsaved files]';;
+    save) _arguments '1:name:' '(-m --message)'{{-m,--message}}'[note]:note:' '--no-shots[no screenshots]' \\
+        '(-f --force)'{{-f,--force}}'[replace]' '--json[JSON output]';;
+    a11y) _values 'action' on off status;;
+    config) _values 'action' show init path;;
+    completion) _values 'shell' zsh bash fish;;
+    import) _files;;
+    *) _arguments '--json[JSON output]' '(-a --all)'{{-a,--all}}'[include automatic]' '--names[names only]' \\
+        '(-y --yes)'{{-y,--yes}}'[do not ask]' '--keep[how many to keep]:n:';;
+  esac
+}}
+compdef _msh-session msh-session 2>/dev/null || _msh-session "$@"
+"""
+
+
+def cmd_completion(a, cfg, store):
+    print(completion(a.shell), end="")
+    return 0
+
+# ───────────────────────────────── main ────────────────────────────────
+
+EPILOG = """\
+snapshot references: NAME, a unique NAME prefix, #N (N-th newest), @active.
+storage: ~/.local/share/msh/sessions/<name>/ (session.toml, unsaved/, shots/, apps/, raw/)
+docs: msh-session <command> --help    config: msh-session config init
+"""
+
+
+def build_parser() -> argparse.ArgumentParser:
+    kw = {"color": True} if sys.version_info >= (3, 14) else {}
+    p = argparse.ArgumentParser(
+        prog="msh-session", formatter_class=argparse.RawDescriptionHelpFormatter, epilog=EPILOG,
+        description="Snapshot, restore and switch whole desktop sessions — windows, places, "
+                    "programs, open files, tabs and unsaved data.", **kw)
+    p.add_argument("--version", action="version", version=f"msh-session {VERSION}")
+    p.add_argument("--no-color", action="store_true", help="plain output (also: NO_COLOR=1)")
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
+
+    def sp(name, fn, **extra):
+        s = sub.add_parser(name, help=COMMANDS[name], description=COMMANDS[name],
+                           formatter_class=argparse.RawDescriptionHelpFormatter, **kw, **extra)
+        s.set_defaults(fn=fn)
+        return s
+
+    def js(s):
+        s.add_argument("--json", action="store_true", help="machine-readable output")
+
+    s = sp("save", cmd_save, aliases=[], epilog="Unsaved data (Kate stash, accessible text, kitty scrollback) "
+                                                "lands in <snapshot>/unsaved/.")
+    s.add_argument("name", nargs="?", help="snapshot name (default: timestamp)")
+    s.add_argument("-m", "--message", help="note stored with the snapshot")
+    s.add_argument("-f", "--force", action="store_true", help="replace an existing snapshot (old one → .trash)")
+    s.add_argument("-y", "--yes", action="store_true", help="do not ask")
+    s.add_argument("--no-shots", action="store_true", help="skip screenshots")
+    s.add_argument("--only", action="append", metavar="CLASS", help="only these window classes (glob, repeatable)")
+    js(s)
+    for name, fn in (("restore", cmd_restore), ("switch", cmd_switch)):
+        s = sp(name, fn, epilog="Floating windows return to the exact pixel; tiled windows return to their "
+                                "workspace (their split order follows launch order).")
+        s.add_argument("name", nargs="?", help="snapshot (picker when omitted)")
+        s.add_argument("-n", "--dry-run", action="store_true", help="only show the plan")
+        s.add_argument("-y", "--yes", action="store_true", help="do not ask before closing windows")
+        s.add_argument("--no-backup", action="store_true", help="skip the automatic snapshot taken first")
+        s.add_argument("--only", action="append", metavar="CLASS",
+                       help="only touch these window classes (glob, repeatable)")
+        s.add_argument("--no-state", action="store_true",
+                       help="windows only: keep workspaces, wallpaper, volume, keyboard layout")
+        js(s)
+        if name == "restore":
+            s.add_argument("--close-others", action="store_true", help="close windows that are not in the snapshot")
+            s.add_argument("--no-place", action="store_true", help="launch only, do not move windows")
+        else:
+            s.add_argument("--keep", action="store_true", help="keep windows that are not in the snapshot")
+            s.add_argument("-u", "--update", action="store_true", help="first re-save the active snapshot")
+    s = sp("list", cmd_list)
+    s.add_argument("-a", "--all", action="store_true", help="include automatic snapshots")
+    s.add_argument("--names", action="store_true", help="names only (for scripts/completion)")
+    js(s)
+    s = sp("show", cmd_show)
+    s.add_argument("name", nargs="?")
+    s.add_argument("--no-files", action="store_true", help="do not list unsaved-data files")
+    js(s)
+    js(sp("status", cmd_status))
+    s = sp("diff", cmd_diff)
+    s.add_argument("a", help="snapshot")
+    s.add_argument("b", nargs="?", help="second snapshot (default: live session)")
+    js(s)
+    s = sp("rm", cmd_rm)
+    s.add_argument("names", nargs="*")
+    s.add_argument("-y", "--yes", action="store_true")
+    s = sp("prune", cmd_prune)
+    s.add_argument("--keep", type=int, default=5, help="automatic snapshots to keep (default 5)")
+    s.add_argument("-y", "--yes", action="store_true")
+    s = sp("rename", cmd_rename)
+    s.add_argument("old")
+    s.add_argument("new")
+    s = sp("path", cmd_path)
+    s.add_argument("name", nargs="?")
+    s = sp("export", cmd_export)
+    s.add_argument("name", nargs="?")
+    s.add_argument("-o", "--output", help="output file")
+    s = sp("import", cmd_import)
+    s.add_argument("file")
+    s.add_argument("--name", help="store under another name")
+    js(sp("doctor", cmd_doctor))
+    s = sp("a11y", cmd_a11y)
+    s.add_argument("action", choices=["on", "off", "status"])
+    s = sp("config", cmd_config)
+    s.add_argument("action", nargs="?", choices=["show", "init", "path"], default="show")
+    js(s)
+    s = sp("completion", cmd_completion)
+    s.add_argument("shell", choices=["zsh", "bash", "fish"])
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if "--no-color" in argv:
+        Out.color = False
+        os.environ["NO_COLOR"] = "1"
+    parser = build_parser()
+    a = parser.parse_args(argv)
+    if not getattr(a, "fn", None):
+        parser.print_help()
+        return 0
+    cfg = load_config()
+    if getattr(a, "only", None):
+        cfg["only"] = [x for o in a.only for x in o.split(",") if x]
+    store = Store(cfg["store"])
+    try:
+        return a.fn(a, cfg, store) or 0
+    except KeyboardInterrupt:
+        return 130
+    except RuntimeError as e:
+        Out.err(str(e))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

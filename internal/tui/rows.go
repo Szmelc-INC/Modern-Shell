@@ -15,10 +15,11 @@ const (
 	tabSecrets
 	tabDirs
 	tabSnapshots
+	tabSessions
 	tabCount
 )
 
-var tabTitles = [tabCount]string{"Addons", "Aliases", "Functions", "Env", "Secrets", "Dirs", "Snapshots"}
+var tabTitles = [tabCount]string{"Addons", "Aliases", "Functions", "Env", "Secrets", "Dirs", "Snapshots", "Sessions"}
 
 // TabNames lists tab ids for --tab and completion.
 func TabNames() []string {
@@ -55,6 +56,7 @@ type row struct {
 	def   *store.Def
 	dir   *store.Dir
 	snap  *store.Snapshot
+	sess  *store.DesktopSession
 }
 
 func boolp(b bool) *bool { return &b }
@@ -144,6 +146,23 @@ func (m *model) loadTab(t int) error {
 		for i := range snaps {
 			s := &snaps[i]
 			rows = append(rows, row{key: "snap:" + s.ID, name: s.ID, value: s.Size, desc: s.Reason, user: true, snap: s})
+		}
+	case tabSessions:
+		sessions, err := store.ListSessions(m.p)
+		if err != nil {
+			return err
+		}
+		for i := range sessions {
+			s := &sessions[i]
+			desc := fmt.Sprintf("%d windows", s.Windows)
+			if s.Unsaved > 0 {
+				desc += fmt.Sprintf(", %d unsaved", s.Unsaved)
+			}
+			if s.Note != "" {
+				desc += " — " + s.Note
+			}
+			rows = append(rows, row{key: "sess:" + s.Name, name: s.Name, value: strings.Replace(s.Created, "T", " ", 1),
+				desc: desc, user: true, sess: s})
 		}
 	}
 	m.rows[t] = rows
@@ -365,6 +384,11 @@ func (m *model) itemHelp(r *row) string {
 	case r.fn != nil:
 		return fmt.Sprintf("# Function %s\n\n%s\n\nCall it as %s. `e` edits here, `E` opens %s in $EDITOR.\n\n---\n\n",
 			r.name, orNone(r.fn.Desc), code(r.name+" [args]"), code(m.p.Tilde(r.fn.File)))
+	case r.sess != nil:
+		return fmt.Sprintf("# Session %s\n\n`r` **restores** it: open windows that belong to it are reused and moved back, "+
+			"missing ones are launched (through UWSM), unsaved Kate documents come back unsaved. "+
+			"`s` **switches**: the same, but windows that are not in it are closed — the current session is saved "+
+			"as an automatic snapshot first.\n\nStored in %s.\n\n---\n\n", r.sess.Name, code(m.p.Tilde(r.sess.Path)))
 	case r.snap != nil:
 		return fmt.Sprintf("# Snapshot %s\n\nRestoring replaces every saved path with this copy and removes paths that did not exist then. "+
 			"A `pre-restore` snapshot is taken first.\n\n---\n\n", r.snap.ID)

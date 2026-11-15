@@ -171,6 +171,11 @@ func candidates(c *Ctx, kind string) []string {
 		for i, s := range snaps {
 			out = append(out, s.ID+"\t#"+fmt.Sprint(i+1)+" "+s.Created+" "+s.Reason)
 		}
+	case "session":
+		sessions, _ := store.ListSessions(c.P)
+		for _, s := range sessions {
+			out = append(out, s.Name+"\t"+s.Created+" "+fmt.Sprint(s.Windows)+" windows")
+		}
 	case "shell":
 		out = []string{"zsh", "bash", "fish"}
 	case "tab":

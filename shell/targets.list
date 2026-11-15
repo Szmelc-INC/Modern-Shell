@@ -9,3 +9,5 @@
 ~/.local/bin/msh
 ~/.local/share/bash-completion/completions/msh
 ~/.config/fish/completions/msh.fish
+~/.local/share/bash-completion/completions/msh-session
+~/.config/fish/completions/msh-session.fish

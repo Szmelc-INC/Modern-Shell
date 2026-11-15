@@ -12,6 +12,7 @@ here, so following this spec is what makes an addon show up nicely in the TUI.
 | `MSH_USER`   | `$MSH_HOME/user`                    | **you** (never overwritten)        |
 | `MSH_CACHE`  | `${XDG_CACHE_HOME:-~/.cache}/msh`   | runtime                            |
 | `MSH_BACKUP` | `~/.BACKUP/msh`                     | `snapshot` addon                   |
+| `MSH_SESSIONS` | `${XDG_DATA_HOME:-~/.local/share}/msh/sessions` | `session` addon (`msh-session`) |
 
 > The Shell Integration Bible puts everything under `~/.zsh/`. Modern Shell
 > deliberately lives in `~/.config/msh` instead, so it never collides with an

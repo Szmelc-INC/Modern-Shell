@@ -314,11 +314,11 @@ type paletteCmd struct{ name, desc string }
 var paletteCmds = []paletteCmd{
 	{"addons", "go to the Addons tab"}, {"aliases", "go to the Aliases tab"}, {"functions", "go to the Functions tab"},
 	{"env", "go to the Env tab"}, {"secrets", "go to the Secrets tab"}, {"dirs", "go to the Directories tab"},
-	{"snapshots", "go to the Snapshots tab"},
+	{"snapshots", "go to the Snapshots tab"}, {"sessions", "go to the desktop Sessions tab"},
 	{"add", "add a new item here"}, {"edit", "edit the selection"}, {"delete", "delete the selection"},
 	{"toggle", "switch the selection on/off"}, {"filter", "filter <text>"}, {"clear", "clear the filter"},
 	{"all", "show/hide addon aliases & functions"}, {"reveal", "reveal/hide all secrets"},
-	{"snapshot", "create a snapshot: snapshot [label]"}, {"edit-config", "open user/msh.conf in $EDITOR"},
+	{"snapshot", "create a snapshot: snapshot [label]"}, {"session-save", "save the desktop session: session-save [name]"}, {"edit-config", "open user/msh.conf in $EDITOR"},
 	{"edit-local", "open user/local.zsh in $EDITOR"}, {"reload", "re-read everything from disk"},
 	{"help", "help for the current tab"}, {"keys", "key bindings"}, {"quit", "leave msh"},
 }
